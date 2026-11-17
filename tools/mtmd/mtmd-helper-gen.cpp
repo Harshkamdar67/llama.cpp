@@ -1324,7 +1324,8 @@ private:
 
 // tiny-voca is not autoregressive: the backbone encodes the phonemes of one sentence, the mmproj turns its states into audio
 // the prompt is a phoneme string, symbols separated by spaces, a stress mark (ˈ or ˌ) before a stressed vowel
-// each sentence is one utterance, like the reference pipeline
+// each sentence is one utterance, like the reference pipeline: the "tts" template ends each one with <eos>
+// a prompt without <eos> (phonemes given by the user) is cut after each sentence mark, and a missing final mark is added
 class tiny_voca_gen_audio_pipeline : public mtmd_gen_audio_pipeline {
 public:
     using mtmd_gen_audio_pipeline::mtmd_gen_audio_pipeline;
@@ -1370,6 +1371,7 @@ public:
 
         // symbols -> (token, stress); the begin and end tokens are added per sentence
         std::vector<std::pair<llama_token, int32_t>> phones;
+        explicit_ends = false;
         const std::string prompt(inp->prompt, inp->prompt_len);
         size_t n_unknown = 0;
         for (size_t i = 0; i < prompt.size();) {
@@ -1394,7 +1396,13 @@ public:
             if (stress > 0) {
                 sym = sym.substr(2);
             }
-            if (sym == "<bos>" || sym == "<eos>" || sym == "<pad>") {
+            if (sym == "<eos>") {
+                // the end of a sentence, as the text was split by the template
+                explicit_ends = true;
+                phones.push_back({ tok_eos, 0 });
+                continue;
+            }
+            if (sym == "<bos>" || sym == "<pad>") {
                 continue;
             }
             auto it = token_of.find(sym);
@@ -1416,7 +1424,7 @@ public:
             return 1;
         }
         for (size_t pos = 0; pos < phones.size();) {
-            while (pos < phones.size() && phones[pos].first == tok_sp) {
+            while (pos < phones.size() && (phones[pos].first == tok_sp || phones[pos].first == tok_eos)) {
                 pos++;
             }
             if (pos == phones.size()) {
@@ -1548,10 +1556,20 @@ private:
 
     // phones of the sentence that starts at pos, cut after a weaker break if it is longer than n_max
     size_t split_len(const std::vector<std::pair<llama_token, int32_t>> & phones, size_t pos, size_t n_max) const {
-        const size_t n_left = phones.size() - pos;
-        for (size_t len = 1; len <= std::min(n_left, n_max); len++) {
-            if (is_any(phones[pos + len - 1].first, "!.?\xe2\x80\xa6")) {
-                return len;
+        size_t n_left = phones.size() - pos;
+        if (explicit_ends) {
+            // up to the next <eos>
+            for (size_t len = 0; len < n_left; len++) {
+                if (phones[pos + len].first == tok_eos) {
+                    n_left = len;
+                    break;
+                }
+            }
+        } else {
+            for (size_t len = 1; len <= std::min(n_left, n_max); len++) {
+                if (is_any(phones[pos + len - 1].first, "!.?\xe2\x80\xa6")) {
+                    return len;
+                }
             }
         }
         if (n_left <= n_max) {
@@ -1573,6 +1591,7 @@ private:
     }
 
     // <bos> phones <eos>; without a final mark the last word breaks off, so a full stop is added
+    // (not when the template has split the text: it adds the stop where the reference does)
     void add_segment(const std::vector<std::pair<llama_token, int32_t>> & phones, size_t pos, size_t len, const std::vector<float> & voice_row) {
         segment seg;
         std::vector<int32_t> stress;
@@ -1587,7 +1606,7 @@ private:
             stress.push_back(phones[i].second);
         }
         const char * last = llama_vocab_get_text(vocab, seg.tokens.back());
-        if (!is_any(seg.tokens.back(), "!.?\xe2\x80\xa6,;:") || last[0] == '\0') {
+        if (!explicit_ends && (!is_any(seg.tokens.back(), "!.?\xe2\x80\xa6,;:") || last[0] == '\0')) {
             seg.tokens.push_back(tok_dot);
             stress.push_back(0);
         }
@@ -1649,6 +1668,7 @@ private:
     llama_token tok_sp  = LLAMA_TOKEN_NULL;
     llama_token tok_unk = LLAMA_TOKEN_NULL;
     llama_token tok_dot = LLAMA_TOKEN_NULL;
+    bool explicit_ends  = false; // the prompt marks the end of each sentence with <eos>
     std::vector<float> tok_emb; // [n_vocab, n_embd]
     std::vector<float> str_emb; // [3, n_embd]
     std::vector<segment> segments;
