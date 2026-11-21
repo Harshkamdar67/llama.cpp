@@ -9562,9 +9562,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
+        // Xe2 with a per-head mask (no GQA packing) and a quantized cache: one workgroup per head reads the whole cache, and
+        // 2 per core leaves a single split for 24 heads on 20 cores. 16 per core: 12.3 -> 1.3 ms at 131K keys, 87 -> 23 us at 1280.
+        const uint32_t fa_mult = ctx->device->vendor_id == VK_VENDOR_ID_INTEL && ctx->device->architecture == INTEL_XE2 ? 16 : 2;
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
-        if (total_wgs_no_split < shader_core_count * 2) {
-            split_k = shader_core_count * 2 / total_wgs_no_split;
+        if (total_wgs_no_split < shader_core_count * fa_mult) {
+            split_k = shader_core_count * fa_mult / total_wgs_no_split;
         }
     }
 
