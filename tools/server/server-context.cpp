@@ -3796,6 +3796,21 @@ private:
             }
         });
 
+        // priority lanes: slots below the highest priority being processed sit this iteration out.
+        // LLAMA_ARG_LANE_SHARE=N lets them run one iteration in N instead of pausing completely.
+        int32_t lane_top = INT32_MIN;
+        for (auto & slot : slots) {
+            if (slot.is_processing() && slot.task) {
+                lane_top = std::max(lane_top, slot.task->params.priority);
+            }
+        }
+        static const int lane_share = getenv("LLAMA_ARG_LANE_SHARE") ? atoi(getenv("LLAMA_ARG_LANE_SHARE")) : 0;
+        static int64_t lane_tick = 0;
+        const bool lane_open = lane_share > 0 && (++lane_tick % lane_share) == 0;
+        auto lane_paused = [&](const server_slot & slot) {
+            return !lane_open && slot.task && slot.task->params.priority < lane_top;
+        };
+
         // start populating the batch for this iteration
         batch.clear();
 
@@ -3808,6 +3823,10 @@ private:
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
+                return;
+            }
+
+            if (lane_paused(slot)) {
                 return;
             }
 
@@ -3954,6 +3973,10 @@ private:
                 }
 
                 if (!slot.is_processing() || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
+                    return;
+                }
+
+                if (lane_paused(slot)) {
                     return;
                 }
 

@@ -8,11 +8,28 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_cooperative_matrix : enable
 #extension GL_EXT_shared_memory_block : enable
+#if defined(KV_Q8_0) || defined(KV_Q4_0)
+#define KV_QUANT 1
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#endif
 
 layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer Q {float16_t data_q[];};
+#if defined(KV_QUANT)
+#include "flash_attn_decode_quant.glsl"
+#define LOAD_K4(i) dequant_kv_4((i) * 4)
+#define NBK1 (p.nbk1 * KV_BLOCK_SIZE)
+#define NBK2 (p.nbk2 * KV_BLOCK_SIZE)
+#define NBK3 (p.nbk3 * KV_BLOCK_SIZE)
+#else
 layout (binding = 1) readonly buffer KV4 {f16vec4 data_kv4[];};
+#define LOAD_K4(i) data_kv4[i]
+#define NBK1 p.nbk1
+#define NBK2 p.nbk2
+#define NBK3 p.nbk3
+#endif
 layout (binding = 2) readonly buffer M {float16_t data_m[];};
 layout (binding = 3) buffer P {float16_t data_p[];};
 layout (binding = 4) buffer MAX {float data_max[];};
@@ -99,22 +116,22 @@ void main() {
     const uint batch_mask_stride = p.nek1 * p.nem1 * p.nem2;
     const uint sg = gl_SubgroupID;
     const uint wg_lane = sg * SubGroupSize + lane;
-    const uint k_dim = p.nbk1;
+    const uint k_dim = NBK1;
     const uint max_dim = (p.nek1 + p_reduce - 1) / p_reduce;
     const uint p_dim = max_dim * p_reduce;
     const uint out_row_idx = sg + out_idx * Br;
     const bool single_head_mask = p.nem2 == 1;
     uint q_offset = min(out_row_idx, p.neq1 - 1) * p.nbq1;
     q_offset = q_offset + batch_idx * p.nbq3 + head_k_idx * p.nbq2 * gqa_ratio;
-    const uint k_base = (batch_k_idx * p.nbk3 + (p_idx * p_reduce) * k_dim + head_k_idx * p.nbk2) / 4;
+    const uint k_base = (batch_k_idx * NBK3 + (p_idx * p_reduce) * k_dim + head_k_idx * NBK2) / 4;
     uint o_offset = batch_idx * p.neq2 * p.neq1 * p_dim + p_idx * p_reduce + head_k_idx * gqa_ratio * p_dim +
                     (sg * warp_o_row + out_idx * Br * p.neq2) * p_dim + lane;
     uint max_offset = batch_idx * p.neq2 * p.neq1 * max_dim + p_idx + head_k_idx * gqa_ratio * max_dim +
                       (sg * warp_o_row + out_idx * Br * p.neq2) * max_dim;
     const uint pvsh_load_offset = sg * warp_o_row * p_reduce + lane;
     const uint mask_base = p_idx * p_reduce + lane;
-    const uint k_seq_boundary = ((p.nek1 - 1) * k_dim + batch_k_idx * p.nbk3 + head_k_idx * p.nbk2 + HSK) / 4 - 1;
-    const uint k_head_base = (batch_k_idx * p.nbk3 + head_k_idx * p.nbk2) / 4;
+    const uint k_seq_boundary = ((p.nek1 - 1) * k_dim + batch_k_idx * NBK3 + head_k_idx * NBK2 + HSK) / 4 - 1;
+    const uint k_head_base = (batch_k_idx * NBK3 + head_k_idx * NBK2) / 4;
     const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
 
     float Maskf[p_reduce / SubGroupSize];
@@ -155,7 +172,7 @@ void main() {
             uint k_offset = k_base + row_idx * k_dim / 4 + col_idx;
             k_offset = min(k_offset, k_seq_boundary);
             const uint ksh_offset = (row_idx * TK + sh_chunk_r * TK * p_per_loop) / 4 + sh_chunk_c;
-            F16V4Poolsh.F16V4sh[ksh_offset] = data_kv4[k_offset];
+            F16V4Poolsh.F16V4sh[ksh_offset] = LOAD_K4(k_offset);
         }
     }
 
@@ -170,7 +187,7 @@ void main() {
                     const uint col_idx = flat_offset % hsk_v4;
                     uint k_offset = k_base + row_idx * k_dim / 4 + col_idx;
                     k_offset = min(k_offset, k_seq_boundary);
-                    kv4_temp[idx] = data_kv4[k_offset];
+                    kv4_temp[idx] = LOAD_K4(k_offset);
                 }
             }
         }
@@ -192,14 +209,14 @@ void main() {
                         coopMatLoad(KMat[c], F16Poolsh.F16sh, coord, TK, gl_CooperativeMatrixLayoutRowMajor);
                     } else {
                         const uint k_base_row = (c * TM + pl * pmat_count * TM + p_idx * p_reduce);
-                        const uint kv4_base_offset = k_head_base + k_base_row * p.nbk1 / 4 + loop * TK / 4;
+                        const uint kv4_base_offset = k_head_base + k_base_row * NBK1 / 4 + loop * TK / 4;
                         [[unroll]] for (uint idx = 0; idx < TM * TK / 4 / SubGroupSize; ++idx) {
                             const uint flat_offset = idx * SubGroupSize + lane;
                             const uint row_idx = flat_offset / (TK / 4);
                             const uint col_idx = flat_offset % (TK / 4);
-                            const uint k_temp_offset = kv4_base_offset + row_idx * p.nbk1 / 4 + col_idx;
+                            const uint k_temp_offset = kv4_base_offset + row_idx * NBK1 / 4 + col_idx;
                             const uint ksh_temp_offset = sg * TM * TK / 4 + idx * SubGroupSize + lane;
-                            f16vec4 kv4_temp = (k_base_row + row_idx) < p.nek1 ? data_kv4[k_temp_offset] : f16vec4(0.0f, 0.0f, 0.0f, 0.0f);
+                            f16vec4 kv4_temp = (k_base_row + row_idx) < p.nek1 ? LOAD_K4(k_temp_offset) : f16vec4(0.0f, 0.0f, 0.0f, 0.0f);
                             F16V4Poolsh.F16V4sh[ksh_temp_offset] = kv4_temp;
                         }
 

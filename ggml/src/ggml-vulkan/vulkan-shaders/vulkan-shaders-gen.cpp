@@ -841,7 +841,7 @@ void process_shaders() {
             string_to_spv("dequant_" + tname, "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
         }
         // Fused dequant+transpose variant for FA quant-KV (per-head-contiguous f16 scratch).
-        if (tname == "q8_0") {
+        if (tname == "q8_0" || tname == "q4_0") {
             string_to_spv("dequant_" + tname + "_transpose", "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"DEQUANT_TRANSPOSE", "1"}}));
         }
 
@@ -959,6 +959,11 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
     string_to_spv("fa_decode_ph2", "flash_attn_decode_phase_2.comp", {}, true, true, false, false);
+    // q8_0/q4_0 K/V variants of the same kernels, dequantizing inline
+    string_to_spv("fa_decode_ph1_q8_0", "flash_attn_decode_phase_1.comp", {{"KV_Q8_0", "1"}}, true, true, false, false);
+    string_to_spv("fa_decode_ph2_q8_0", "flash_attn_decode_phase_2.comp", {{"KV_Q8_0", "1"}}, true, true, false, false);
+    string_to_spv("fa_decode_ph1_q4_0", "flash_attn_decode_phase_1.comp", {{"KV_Q4_0", "1"}}, true, true, false, false);
+    string_to_spv("fa_decode_ph2_q4_0", "flash_attn_decode_phase_2.comp", {{"KV_Q4_0", "1"}}, true, true, false, false);
     string_to_spv("fa_prefill", "flash_attn_prefill.comp", {}, true, true, false, false);
 #endif
 

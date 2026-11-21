@@ -53,6 +53,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Specify the minimum line indentation for the generated text in number of whitespace characters. Useful for code completion tasks"));
 
+    add((new field_num("priority", params.priority))
+        ->set_hard_limits(-1000, 1000)
+        ->set_desc("Scheduling lane. While a request with a higher priority is being processed, requests with a lower one are paused and resume afterwards (default: 0)"));
+
     add((new field_num("n_keep", params.n_keep))
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Specify the number of tokens from the initial prompt to retain when context size is exceeded. Use -1 to retain all tokens from the prompt"));

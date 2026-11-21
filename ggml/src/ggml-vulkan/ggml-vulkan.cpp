@@ -3289,6 +3289,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         return is_rdna3_or_4 ? 4u : rows;
     };
+    // Xe2 on the Windows driver: one row per workgroup leaves the integer path 35-40% behind for q4_k/q5_k/q6_k.
+    // Arc Pro B60, q4_k 17408x5120, us per call at n=1/3/8: 1 row 169/193/262, 2 rows 138/138/184, 4 rows 122/127/202
+    const bool xe2_windows = device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == vk_device_architecture::INTEL_XE2 &&
+                             device->driver_id == vk::DriverId::eIntelProprietaryWindows && !getenv("GGML_VK_XE2_OLD_MMVQ");
+    auto const &rm_kq_int_n = [&](uint32_t i, bool q6) {
+        if (xe2_windows) { return (q6 || i < 4) ? 4u : 2u; }
+        return rm_int_n(1*rm_kq_int, i);
+    };
     uint32_t rm_iq = 2 * rm_kq;
 
     const bool use_subgroups = device->subgroup_arithmetic;
@@ -3402,9 +3410,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_q8_1_f32", arr_dmmv_q2_k_q8_1_f32_len[reduc], arr_dmmv_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32", arr_dmmv_q3_k_q8_1_f32_len[reduc], arr_dmmv_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_q8_1_f32", arr_dmmv_q4_k_q8_1_f32_len[reduc], arr_dmmv_q4_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_q8_1_f32", arr_dmmv_q6_k_q8_1_f32_len[reduc], arr_dmmv_q6_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_q8_1_f32", arr_dmmv_q4_k_q8_1_f32_len[reduc], arr_dmmv_q4_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq_int_n(i, false), 1, 1}, {wg_size_subgroup_int, rm_kq_int_n(i, false), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq_int_n(i, false), 1, 1}, {wg_size_subgroup_int, rm_kq_int_n(i, false), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_q8_1_f32", arr_dmmv_q6_k_q8_1_f32_len[reduc], arr_dmmv_q6_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq_int_n(i, true), 1, 1}, {wg_size_subgroup_int, rm_kq_int_n(i, true), i+1}, 1, true, use_subgroups, subgroup_size_int);
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_S][i], "mul_mat_vec_iq1_s_q8_1_f32", arr_dmmv_iq1_s_q8_1_f32_len[reduc], arr_dmmv_iq1_s_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_M][i], "mul_mat_vec_iq1_m_q8_1_f32", arr_dmmv_iq1_m_q8_1_f32_len[reduc], arr_dmmv_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -3492,6 +3500,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q5_1], "dequant_q5_1", dequant_q5_1_len, dequant_q5_1_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q8_0], "dequant_q8_0", dequant_q8_0_len, dequant_q8_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q8_0], "dequant_q8_0_transpose", dequant_q8_0_transpose_len, dequant_q8_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q4_0], "dequant_q4_0_transpose", dequant_q4_0_transpose_len, dequant_q4_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q2_K], "dequant_q2_k", dequant_q2_k_len, dequant_q2_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q3_K], "dequant_q3_k", dequant_q3_k_len, dequant_q3_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q4_K], "dequant_q4_k", dequant_q4_k_len, dequant_q4_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
@@ -3595,6 +3604,27 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                              xe_fa_params.tm, xe_fa_params.tn, xe_fa_params.decode_params.pipeline_flag_ph2 };
             ggml_vk_create_pipeline(device, pipelines.first, "xe_fa_decode_ph1", fa_decode_ph1_cm1_len, fa_decode_ph1_cm1_data, "main", 5, sizeof(vk_xe_fa_push_constants), { 1, xe_fa_params.decode_params.p_chunk_ph1, 1 }, sc_ph1, 1, false, true, xe_fa_params.subgroup_size[0]);
             ggml_vk_create_pipeline(device, pipelines.second, "xe_fa_decode_ph2", fa_decode_ph2_cm1_len, fa_decode_ph2_cm1_data, "main", 5, sizeof(vk_xe_fa_push_constants), { 1, 1, 1 }, sc_ph2, 1, false, true, xe_fa_params.subgroup_size[0]);
+        }
+
+        for (auto& it : device->pipeline_xe_fa_decode_dual_phases_quant) {
+            const bool q8 = it.first.first == GGML_TYPE_Q8_0;
+            auto pipeline_state = it.first.second;
+            auto& pipelines = it.second;
+            xe_fa_params = get_xe_fa_tuning_params(device.get(), pipeline_state, false);
+            std::vector<uint32_t> sc_ph1 = { xe_fa_params.workgroup_size[0], pipeline_state.qk_ratio, pipeline_state.HSK,
+                                             xe_fa_params.subgroup_size[0], xe_fa_params.decode_params.p_chunk_ph1,
+                                             xe_fa_params.decode_params.out_per_wg_ph1, xe_fa_params.decode_params.p_chunk_ph1 / xe_fa_params.tm,
+                                             xe_fa_params.tm, xe_fa_params.tn, shmem_sz };
+            std::vector<uint32_t> sc_ph2 = { xe_fa_params.workgroup_size[1], pipeline_state.pv_ratio, pipeline_state.HSV,
+                                             xe_fa_params.decode_params.out_row_per_wg_ph2, xe_fa_params.subgroup_size[1], xe_fa_params.decode_params.split_p_per_iter_ph2,
+                                             xe_fa_params.decode_params.p_chunk_ph1, xe_fa_params.decode_params.out_col_per_wg_ph2,
+                                             xe_fa_params.tm, xe_fa_params.tn, xe_fa_params.decode_params.pipeline_flag_ph2 };
+            ggml_vk_create_pipeline(device, pipelines.first, q8 ? "xe_fa_decode_ph1_q8_0" : "xe_fa_decode_ph1_q4_0",
+                                    q8 ? fa_decode_ph1_q8_0_cm1_len : fa_decode_ph1_q4_0_cm1_len, q8 ? (const void *)fa_decode_ph1_q8_0_cm1_data : (const void *)fa_decode_ph1_q4_0_cm1_data,
+                                    "main", 5, sizeof(vk_xe_fa_push_constants), { 1, xe_fa_params.decode_params.p_chunk_ph1, 1 }, sc_ph1, 1, false, true, xe_fa_params.subgroup_size[0]);
+            ggml_vk_create_pipeline(device, pipelines.second, q8 ? "xe_fa_decode_ph2_q8_0" : "xe_fa_decode_ph2_q4_0",
+                                    q8 ? fa_decode_ph2_q8_0_cm1_len : fa_decode_ph2_q4_0_cm1_len, q8 ? (const void *)fa_decode_ph2_q8_0_cm1_data : (const void *)fa_decode_ph2_q4_0_cm1_data,
+                                    "main", 5, sizeof(vk_xe_fa_push_constants), { 1, 1, 1 }, sc_ph2, 1, false, true, xe_fa_params.subgroup_size[0]);
         }
 
         for (auto& it : device->pipeline_xe_fa_prefill) {
@@ -7500,6 +7530,13 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
             }
         }
 
+        if (device->architecture == vk_device_architecture::INTEL_XE2 && device->driver_id == vk::DriverId::eIntelProprietaryWindows &&
+            k >= 2048 && (src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q5_K) && !getenv("GGML_VK_XE2_OLD_MMVQ")) {
+            // with four rows per workgroup (see rm_kq_int_n) the integer path is ahead of fp16 here too:
+            // Arc Pro B60, 17408x5120 n=1: q4_k 122 us vs 127, q5_k 151 vs 160
+            return true;
+        }
+
         if (device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
             // Intel Windows proprietary driver MMVQ performance for !Q2/Q3/Q6 is worse than fp16,
             // see https://github.com/ggml-org/llama.cpp/issues/17628 and
@@ -9195,9 +9232,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     bool xe_fa_opt = false;
     bool xe_fa_use_2phases = false;
     bool xe_fa_supported_platform = vk_dev->xe_fa_support && vk_dev->properties.deviceID != 0xFD80 && vk_dev->properties.deviceID != 0xFD81;
+    // quantized K/V of a large batch were converted above into a dense f16 scratch ([head][token][dim]), which the prefill kernel can read
+    const bool xe_fa_dequant_kv = use_dequant_kv && !kv_raw_strided && neq1 > 8 && !getenv("GGML_VK_XE_FA_NO_DEQUANT_PREFILL");
     bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && mask != nullptr && !use_sparse && max_bias == 0.0f && logit_softcap == 0.0f &&
-                                 tensor_aligned_with(k, 16u) && tensor_aligned_with(v, 16u);
-    bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                                 (xe_fa_dequant_kv || (tensor_aligned_with(k, 16u) && tensor_aligned_with(v, 16u)));
+    // q8_0/q4_0 K/V: only the dual-phase decode kernel reads them (dequantizing inline); larger batches keep the generic path
+    const bool xe_fa_kv_quant = (k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0) && v->type == k->type &&
+                                neq1 <= 8 && neq2 / nev2 <= 64 && neq0 % 32 == 0 && nev0 % 32 == 0 && !getenv("GGML_VK_XE_FA_NO_QUANT_KV");
+    bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && ((k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) || xe_fa_kv_quant || xe_fa_dequant_kv) &&
                                  mask != nullptr && mask->type == GGML_TYPE_F16;
     xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype;
     std::pair<vk_pipeline, vk_pipeline> xe_fa_pipeline_dual_phases = { nullptr , nullptr };
@@ -9248,13 +9290,25 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 if (xe_fa_params.shmem_sz <= vk_dev->properties.limits.maxComputeSharedMemorySize &&
                     ph1_wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                     size_decode_temp <= ctx->device->properties.limits.maxStorageBufferRange) {
-                    auto& pipelines = ctx->device->pipeline_xe_fa_decode_dual_phases;
-                    auto it = pipelines.find(decode_state);
-                    if (it != pipelines.end()) {
-                        xe_fa_pipeline_dual_phases = it->second;
+                    if (xe_fa_kv_quant) {
+                        auto& pipelines = ctx->device->pipeline_xe_fa_decode_dual_phases_quant;
+                        const auto key = std::make_pair(k->type, decode_state);
+                        auto it = pipelines.find(key);
+                        if (it != pipelines.end()) {
+                            xe_fa_pipeline_dual_phases = it->second;
+                        } else {
+                            pipelines[key] = xe_fa_pipeline_dual_phases =
+                                std::make_pair(std::make_shared<vk_pipeline_struct>(), std::make_shared<vk_pipeline_struct>());
+                        }
                     } else {
-                        pipelines[decode_state] = xe_fa_pipeline_dual_phases =
-                            std::make_pair(std::make_shared<vk_pipeline_struct>(), std::make_shared<vk_pipeline_struct>());
+                        auto& pipelines = ctx->device->pipeline_xe_fa_decode_dual_phases;
+                        auto it = pipelines.find(decode_state);
+                        if (it != pipelines.end()) {
+                            xe_fa_pipeline_dual_phases = it->second;
+                        } else {
+                            pipelines[decode_state] = xe_fa_pipeline_dual_phases =
+                                std::make_pair(std::make_shared<vk_pipeline_struct>(), std::make_shared<vk_pipeline_struct>());
+                        }
                     }
                     xe_fa_use_2phases = true;
                 } else {
@@ -9530,11 +9584,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     if (xe_fa_opt) {
         uint32_t head_stride_q = uint32_t(nbq2 / ggml_type_size(q->type));
-        uint32_t head_stride_k = uint32_t(nbk2 / ggml_type_size(k->type));
-        uint32_t head_stride_v = uint32_t(nbv2 / ggml_type_size(v->type));
+        uint32_t head_stride_k = xe_fa_dequant_kv ? uint32_t(nbk2_eff / sizeof(ggml_fp16_t)) : uint32_t(nbk2 / ggml_type_size(k->type));
+        uint32_t head_stride_v = xe_fa_dequant_kv ? uint32_t(nbv2_eff / sizeof(ggml_fp16_t)) : uint32_t(nbv2 / ggml_type_size(v->type));
         uint32_t batch_stride_q = uint32_t(nbq3 / ggml_type_size(q->type));
-        uint32_t batch_stride_k = uint32_t(nbk3 / ggml_type_size(k->type));
-        uint32_t batch_stride_v = uint32_t(nbv3 / ggml_type_size(v->type));
+        uint32_t batch_stride_k = xe_fa_dequant_kv ? uint32_t(nbk3_eff / sizeof(ggml_fp16_t)) : uint32_t(nbk3 / ggml_type_size(k->type));
+        uint32_t batch_stride_v = xe_fa_dequant_kv ? uint32_t(nbv3_eff / sizeof(ggml_fp16_t)) : uint32_t(nbv3 / ggml_type_size(v->type));
         uint32_t batch_stride_o = uint32_t(nb3 / ggml_type_size(dst->type));
 
         vk_xe_fa_push_constants pc_xe_fa = { (uint32_t)neq1, (uint32_t)neq2, (uint32_t)neq3,

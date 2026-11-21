@@ -1044,6 +1044,8 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     std::map<vk_xe_fa_pipeline_state, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
+    // q8_0/q4_0 K/V variants of the dual-phase decode kernel
+    std::map<std::pair<ggml_type, vk_xe_fa_pipeline_state>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases_quant;
     std::map<vk_xe_fa_pipeline_state, vk_pipeline> pipeline_xe_fa_prefill;
     vk_pipeline pipeline_count_experts;
 
