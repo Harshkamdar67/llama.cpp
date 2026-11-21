@@ -11562,6 +11562,64 @@ void ggml_compute_forward_dsv4_hc_pre(
     }
 }
 
+// ggml_compute_forward_inkling_rel_mask
+
+void ggml_compute_forward_inkling_rel_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * r       = dst->src[0];
+    const ggml_tensor * bias    = dst->src[1];
+    const ggml_tensor * sinks   = dst->src[2];
+    const ggml_tensor * rel_pos = dst->src[3];
+    const ggml_tensor * mask    = dst->src[4];
+
+    const int64_t n_rel    = r->ne[0];
+    const int64_t n_head   = r->ne[1];
+    const int64_t n_extent = bias->ne[1];
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_tps    = dst->ne[1]; // tokens per stream
+    const int64_t n_stream = dst->ne[3];
+
+    const float * rd = (const float *) r->data;
+    const float * bd = (const float *) bias->data;
+    const int32_t * pd = (const int32_t *) rel_pos->data;
+
+    std::vector<float> table(n_extent);
+
+    // one (token, head) row per job: its table, then every key
+    const int64_t n_jobs = n_tps*n_stream*n_head;
+    for (int64_t job = params->ith; job < n_jobs; job += params->nth) {
+        const int64_t h  = job % n_head;
+        const int64_t tt = job / n_head;
+        const int64_t s  = tt / n_tps;
+        const int64_t t  = tt % n_tps;
+
+        const float * rv = rd + n_rel*(h + n_head*tt);
+        for (int64_t d = 0; d < n_extent; ++d) {
+            float acc = 0.0f;
+            for (int64_t k = 0; k < n_rel; ++k) {
+                acc += rv[k]*bd[k + n_rel*d];
+            }
+            table[d] = acc;
+        }
+        const float sink = *(const float *) ((const char *) sinks->data + h*sinks->nb[0] + tt*sinks->nb[1]);
+
+        const char * mrow = (const char *) mask->data + t*mask->nb[1] + s*mask->nb[3];
+        char       * orow = (char *)       dst->data  + t*dst->nb[1]  + h*dst->nb[2] + s*dst->nb[3];
+        for (int64_t kv = 0; kv < n_kv; ++kv) {
+            const int32_t d = pd[kv + n_kv*tt];
+            const float   b = d >= 0 && d < n_extent ? table[d] : 0.0f;
+            const float   m = mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mrow)[kv]) : ((const float *) mrow)[kv];
+            const float   v = b - sink + m;
+            if (dst->type == GGML_TYPE_F16) {
+                ((ggml_fp16_t *) orow)[kv] = GGML_CPU_FP32_TO_FP16(v);
+            } else {
+                ((float *) orow)[kv] = v;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_inkling_loop_gate
 
 void ggml_compute_forward_inkling_loop_gate(

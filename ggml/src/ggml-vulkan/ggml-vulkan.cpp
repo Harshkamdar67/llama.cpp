@@ -4092,6 +4092,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_inkling_rel_mask_f16, "inkling_rel_mask_f16", inkling_rel_mask_f16_len, inkling_rel_mask_f16_data, "main", 6, sizeof(vk_op_inkling_rel_mask_push_constants), {1, 1, 1}, { 256 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_loop_gate_f32[0], "inkling_loop_gate_a_f32", inkling_loop_gate_f32_len, inkling_loop_gate_f32_data, "main", 6, sizeof(vk_op_inkling_loop_gate_push_constants), {1, 1, 1}, { 256, 0 }, 1, false, true);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_loop_gate_f32[1], "inkling_loop_gate_b_f32", inkling_loop_gate_f32_len, inkling_loop_gate_f32_data, "main", 6, sizeof(vk_op_inkling_loop_gate_push_constants), {256, 1, 1}, { 256, 1 }, 1, false, true);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
@@ -8198,6 +8199,36 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     init_pushconst_tensor_offsets(ctx, pc, x, residual, p_src, comb, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+}
+
+void ggml_vk_inkling_rel_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * r       = dst->src[0];
+    const ggml_tensor * bias    = dst->src[1];
+    const ggml_tensor * sinks   = dst->src[2];
+    const ggml_tensor * rel_pos = dst->src[3];
+    const ggml_tensor * mask    = dst->src[4];
+
+    vk_pipeline pipeline = ctx->device->pipeline_inkling_rel_mask_f16;
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer r_buf = ggml_vk_tensor_subbuffer(ctx, r,       true);
+    const vk_subbuffer b_buf = ggml_vk_tensor_subbuffer(ctx, bias,    true);
+    const vk_subbuffer s_buf = ggml_vk_tensor_subbuffer(ctx, sinks,   true);
+    const vk_subbuffer p_buf = ggml_vk_tensor_subbuffer(ctx, rel_pos, true);
+    const vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, mask,    true);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst,     true);
+
+    vk_op_inkling_rel_mask_push_constants pc = {
+        (uint32_t) r->ne[0], (uint32_t) r->ne[1], (uint32_t) bias->ne[1], (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
+        ggml_vk_nb_elem(sinks, 1), ggml_vk_nb_elem(mask, 1), ggml_vk_nb_elem(mask, 3),
+        ggml_vk_nb_elem(dst, 1), ggml_vk_nb_elem(dst, 2), ggml_vk_nb_elem(dst, 3),
+        0, 0, 0, 0, 0, 0,
+    };
+    init_pushconst_tensor_offsets(ctx, pc, r, bias, sinks, rel_pos, dst);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { r_buf, b_buf, s_buf, p_buf, m_buf, d_buf }, pc, { (uint32_t) r->ne[1], (uint32_t) r->ne[2], 1 });
 }
 
 void ggml_vk_inkling_loop_gate(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -13896,6 +13927,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_inkling_loop_gate(ctx, compute_ctx, node);
 
         break;
+    case GGML_OP_INKLING_REL_MASK:
+        ggml_vk_inkling_rel_mask(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_MEAN:
         ggml_vk_mean(ctx, compute_ctx, src0, node);
 
@@ -17175,6 +17210,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return false;
             }
+        case GGML_OP_INKLING_REL_MASK:
+            // F16 mask in and out (the flash attention case); the bias row lives in shared memory
+            return op->type == GGML_TYPE_F16 && op->src[4]->type == GGML_TYPE_F16 && op->src[1]->ne[1] <= 4096 && op->src[0]->ne[0] <= 64;
         case GGML_OP_INKLING_LOOP_GATE:
             // the shader keeps [cur; msg] (n_embd <= 4096) and the rank sums (<= 128) in shared memory
             return device->subgroup_arithmetic && device->subgroup_require_full_support && op->src[0]->ne[0] <= 4096 && op->src[2]->ne[1] <= 128;

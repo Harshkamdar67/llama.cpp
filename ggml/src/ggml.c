@@ -1100,6 +1100,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "TOP_K_MASK",
     "INKLING_LOOP_GATE",
+    "INKLING_REL_MASK",
 
     "UNARY",
 
@@ -1119,7 +1120,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,6 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "inkling_loop_gate(cur, msg, down, gain, forget)",
+    "inkling_rel_mask(r, bias, sinks, rel_pos, mask)",
 
     "unary(x)",
 
@@ -1235,7 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6524,6 +6526,46 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * gate,
         float                 scale) {
     return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+}
+
+// ggml_inkling_rel_mask
+
+struct ggml_tensor * ggml_inkling_rel_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * sinks,
+        struct ggml_tensor  * rel_pos,
+        struct ggml_tensor  * mask,
+        enum ggml_type        type) {
+    const int64_t n_rel    = r->ne[0];
+    const int64_t n_head   = r->ne[1];
+    const int64_t n_tokens = r->ne[2];
+    const int64_t n_kv     = rel_pos->ne[0];
+    const int64_t n_stream = mask->ne[3];
+
+    GGML_ASSERT(r->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32 && sinks->type == GGML_TYPE_F32);
+    GGML_ASSERT(rel_pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(r) && ggml_is_contiguous(bias) && ggml_is_contiguous(rel_pos));
+    GGML_ASSERT(bias->ne[0] == n_rel);
+    GGML_ASSERT(sinks->ne[0] == n_head && sinks->ne[1] == n_tokens && sinks->nb[0] == sizeof(float));
+    GGML_ASSERT(rel_pos->ne[1] == n_tokens);
+    GGML_ASSERT(n_tokens % n_stream == 0);
+    GGML_ASSERT(mask->ne[0] == n_kv && mask->ne[1] == n_tokens/n_stream && mask->ne[2] == 1);
+    GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type));
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, n_head, n_stream);
+
+    result->op     = GGML_OP_INKLING_REL_MASK;
+    result->src[0] = r;
+    result->src[1] = bias;
+    result->src[2] = sinks;
+    result->src[3] = rel_pos;
+    result->src[4] = mask;
+
+    return result;
 }
 
 // ggml_inkling_loop_gate

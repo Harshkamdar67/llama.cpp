@@ -411,8 +411,17 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        ggml_tensor * table;
-        if (n_tokens == 1) {
+        ggml_tensor * mask_raw = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+        static const bool no_fuse_mask = getenv("LLAMA_INKLING_NO_FUSE") != nullptr;
+        ggml_tensor * kq_b = nullptr;
+        if (!no_fuse_mask && cparams.flash_attn && mask_raw->type == GGML_TYPE_F16 && layer.attn_rel_bias->type == GGML_TYPE_F32) {
+            // the whole per-head mask in one op, written once in F16: bias row by distance, minus the sink, plus the mask
+            kq_b = ggml_inkling_rel_mask(ctx0, Rcur, layer.attn_rel_bias, sinks, rel_pos, mask_raw, GGML_TYPE_F16);
+        }
+        ggml_tensor * table = nullptr;
+        if (kq_b) {
+            // built above
+        } else if (n_tokens == 1) {
             // one token: multiply in the other order and the table comes out as [n_head, n_extent] without a transpose
             table = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, Rcur, hparams.n_relative, n_head), ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0));
             table = ggml_sub(ctx0, table, sinks);
@@ -423,9 +432,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
         }
 
-        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
-        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+        if (!kq_b) {
+            kq_b = ggml_get_rows(ctx0, table, rel_pos);
+            kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+            kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+        }
         cb(kq_b, "kq_b", il);
 
         if (!sinks_zero || sinks_zero->ne[0] != n_head) {

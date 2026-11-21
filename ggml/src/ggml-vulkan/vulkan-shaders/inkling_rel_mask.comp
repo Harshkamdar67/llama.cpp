@@ -1,0 +1,83 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Inkling 2 attention mask with the relative-position bias and the per-query sink folded in.
+// Workgroup (h, tt): build the bias row of head h for token tt over all distances in shared memory,
+// then write mask + row[rel_pos] - sink for every key, straight to F16.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_rel;
+    uint n_head;
+    uint n_extent;
+    uint n_kv;
+    uint n_tps;     // tokens per stream
+
+    uint nbs1;      // sinks token stride, elements
+    uint nbm1;      // mask strides, elements
+    uint nbm3;
+    uint nbd1;      // dst strides, elements
+    uint nbd2;
+    uint nbd3;
+
+    uint r_offset;
+    uint b_offset;
+    uint s_offset;
+    uint p_offset;
+    uint m_offset;
+    uint d_offset;
+};
+
+layout(binding = 0) readonly  buffer R { float     data_r[]; };
+layout(binding = 1) readonly  buffer B { float     data_b[]; };
+layout(binding = 2) readonly  buffer S { float     data_s[]; };
+layout(binding = 3) readonly  buffer P { int       data_p[]; };
+layout(binding = 4) readonly  buffer M { float16_t data_m[]; };
+layout(binding = 5) writeonly buffer D { float16_t data_d[]; };
+
+const uint MAX_EXTENT = 4096;
+
+shared float row[MAX_EXTENT];
+shared float rv[64];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint h   = gl_WorkGroupID.x;
+    const uint tt  = gl_WorkGroupID.y;
+    const uint s   = tt / n_tps;
+    const uint t   = tt % n_tps;
+
+    const uint r_base = r_offset + n_rel*(h + n_head*tt);
+    for (uint k = tid; k < n_rel; k += BLOCK_SIZE) {
+        rv[k] = data_r[r_base + k];
+    }
+    barrier();
+
+    for (uint d = tid; d < n_extent; d += BLOCK_SIZE) {
+        const uint b_base = b_offset + n_rel*d;
+        float acc = 0.0;
+        for (uint k = 0; k < n_rel; ++k) {
+            acc += rv[k]*data_b[b_base + k];
+        }
+        row[d] = acc;
+    }
+    barrier();
+
+    const float sink = data_s[s_offset + h + nbs1*tt];
+    const uint  p_row = p_offset + n_kv*tt;
+    const uint  m_row = m_offset + t*nbm1 + s*nbm3;
+    const uint  d_row = d_offset + t*nbd1 + h*nbd2 + s*nbd3;
+
+    for (uint kv = tid; kv < n_kv; kv += BLOCK_SIZE) {
+        const int   dist = data_p[p_row + kv];
+        const float b    = (dist >= 0 && uint(dist) < n_extent) ? row[dist] : 0.0;
+        data_d[d_row + kv] = float16_t(b - sink + float(data_m[m_row + kv]));
+    }
+}

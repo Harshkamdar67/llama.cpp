@@ -416,6 +416,7 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
         GGML_OP_INKLING_LOOP_GATE,
+        GGML_OP_INKLING_REL_MASK,
 
         GGML_OP_UNARY,
 
@@ -2503,6 +2504,20 @@ extern "C" {
     //   d      = down * [rms_norm(cur, eps); rms_norm(msg, eps)]          (down: [2*n_embd, rank])
     //   result = cur*(1 - tanh(forget*d)) + tanh(gain*d)*msg              (gain, forget: [rank, n_embd])
     // cur and msg are [n_embd, n_tokens] with contiguous rows; the result is a view of [n_embd + 2*rank, n_tokens]
+    // Inkling 2 attention mask with the relative-position bias and the per-query sink folded in:
+    //   result[kv, t, h, s] = (d < n_extent ? sum_k r[k, h, tt]*bias[k, d] : 0) - sinks[h, tt] + mask[kv, t, 0, s]
+    //   with tt = s*(n_tokens/n_stream) + t and d = rel_pos[kv, tt]
+    // r: [n_rel, n_head, n_tokens], bias: [n_rel, n_extent], sinks: [n_head, n_tokens], rel_pos: I32 [n_kv, n_tokens],
+    // mask: [n_kv, n_tokens/n_stream, 1, n_stream] (F16 or F32); result: [n_kv, n_tokens/n_stream, n_head, n_stream]
+    GGML_API struct ggml_tensor * ggml_inkling_rel_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * sinks,
+            struct ggml_tensor  * rel_pos,
+            struct ggml_tensor  * mask,
+            enum ggml_type        type);
+
     GGML_API struct ggml_tensor * ggml_inkling_loop_gate(
             struct ggml_context * ctx,
             struct ggml_tensor  * cur,

@@ -4778,6 +4778,62 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_INKLING_REL_MASK
+struct test_inkling_rel_mask : public test_case {
+    const int64_t n_rel;
+    const int64_t n_head;
+    const int64_t n_extent;
+    const int64_t n_kv;
+    const int64_t n_tokens;
+    const int64_t n_stream;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_REL_MASK";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_rel, n_head, n_extent, n_kv, n_tokens, n_stream);
+    }
+
+    test_inkling_rel_mask(int64_t n_rel = 16, int64_t n_head = 4, int64_t n_extent = 32, int64_t n_kv = 64, int64_t n_tokens = 2, int64_t n_stream = 1)
+        : n_rel(n_rel), n_head(n_head), n_extent(n_extent), n_kv(n_kv), n_tokens(n_tokens), n_stream(n_stream) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(7);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                // distances, with n_extent standing for every key out of range
+                std::vector<int32_t> v(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> dist(0, (int32_t) n_extent);
+                for (auto & x : v) {
+                    x = dist(rng);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * r       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, n_head, n_tokens);
+        ggml_tensor * bias    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rel, n_extent);
+        ggml_tensor * sinks   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_tokens);
+        ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_tokens);
+        ggml_tensor * mask    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tokens/n_stream, 1, n_stream);
+        ggml_set_name(r, "r");
+        ggml_set_name(bias, "bias");
+        ggml_set_name(sinks, "sinks");
+        ggml_set_name(rel_pos, "rel_pos");
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * out = ggml_inkling_rel_mask(ctx, r, bias, sinks, rel_pos, mask, GGML_TYPE_F16);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_INKLING_LOOP_GATE
 struct test_inkling_loop_gate : public test_case {
     const int64_t n_embd;
@@ -10864,6 +10920,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    test_cases.emplace_back(new test_inkling_rel_mask(16, 4, 32, 64, 2, 1));
+    test_cases.emplace_back(new test_inkling_rel_mask(16, 24, 1024, 1536, 1, 1));
+    test_cases.emplace_back(new test_inkling_rel_mask(16, 24, 1024, 4096, 7, 1));
+    test_cases.emplace_back(new test_inkling_rel_mask(16, 24, 1024, 1536, 8, 2));
     test_cases.emplace_back(new test_inkling_loop_gate(64, 8, 1, false));
     test_cases.emplace_back(new test_inkling_loop_gate(64, 8, 3, true));
     test_cases.emplace_back(new test_inkling_loop_gate(2304, 64, 1, false));

@@ -232,6 +232,28 @@ struct vk_op_dsv4_hc_pre_push_constants {
     float scale;
 };
 
+struct vk_op_inkling_rel_mask_push_constants {
+    uint32_t n_rel;
+    uint32_t n_head;
+    uint32_t n_extent;
+    uint32_t n_kv;
+    uint32_t n_tps;
+
+    uint32_t nbs1;
+    uint32_t nbm1;
+    uint32_t nbm3;
+    uint32_t nbd1;
+    uint32_t nbd2;
+    uint32_t nbd3;
+
+    uint32_t r_offset;
+    uint32_t b_offset;
+    uint32_t s_offset;
+    uint32_t p_offset;
+    uint32_t m_offset;
+    uint32_t d_offset;
+};
+
 struct vk_op_inkling_loop_gate_push_constants {
     uint32_t n_embd;
     uint32_t rank;
@@ -1075,6 +1097,16 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
 
     GGML_UNUSED(src2);
     GGML_UNUSED(src3);
+}
+
+// the fifth source, mask, comes from dst
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_inkling_rel_mask_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.r_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.b_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+    p.s_offset = get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type);
+    p.p_offset = get_misalign_bytes(ctx, src3) / ggml_type_size(src3->type);
+    p.m_offset = get_misalign_bytes(ctx, dst->src[4]) / ggml_type_size(dst->src[4]->type);
+    p.d_offset = get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type);
 }
 
 // the fifth source, forget, comes from dst
