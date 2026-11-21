@@ -415,6 +415,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_INKLING_LOOP_GATE,
 
         GGML_OP_UNARY,
 
@@ -2497,6 +2498,19 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Inkling 2 loop message gate, one token per column:
+    //   d      = down * [rms_norm(cur, eps); rms_norm(msg, eps)]          (down: [2*n_embd, rank])
+    //   result = cur*(1 - tanh(forget*d)) + tanh(gain*d)*msg              (gain, forget: [rank, n_embd])
+    // cur and msg are [n_embd, n_tokens] with contiguous rows; the result is a view of [n_embd + 2*rank, n_tokens]
+    GGML_API struct ggml_tensor * ggml_inkling_loop_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * gain,
+            struct ggml_tensor  * forget,
+            float                 eps);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

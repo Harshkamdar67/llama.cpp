@@ -11562,6 +11562,63 @@ void ggml_compute_forward_dsv4_hc_pre(
     }
 }
 
+// ggml_compute_forward_inkling_loop_gate
+
+void ggml_compute_forward_inkling_loop_gate(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * cur    = dst->src[0];
+    const ggml_tensor * msg    = dst->src[1];
+    const ggml_tensor * down   = dst->src[2];
+    const ggml_tensor * gain   = dst->src[3];
+    const ggml_tensor * forget = dst->src[4];
+
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+    const int64_t rank     = down->ne[1];
+    const float   eps      = ggml_get_op_params_f32(dst, 0);
+
+    std::vector<float> d(rank);
+
+    for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
+        const float * c = (const float *) ((const char *) cur->data + t*cur->nb[1]);
+        const float * m = (const float *) ((const char *) msg->data + t*msg->nb[1]);
+        float       * o = (float *)       ((char *)       dst->data + t*dst->nb[1]);
+
+        ggml_float sc = 0.0, sm = 0.0;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            sc += (ggml_float) c[i]*c[i];
+            sm += (ggml_float) m[i]*m[i];
+        }
+        const float rc = 1.0f/sqrtf((float) (sc/n_embd) + eps);
+        const float rm = 1.0f/sqrtf((float) (sm/n_embd) + eps);
+
+        // the rows after the result hold the unnormalized halves of the down projection, as the GPU passes do
+        for (int64_t r = 0; r < rank; ++r) {
+            const float * w = (const float *) ((const char *) down->data + r*down->nb[1]);
+            float acc_c = 0.0f, acc_m = 0.0f;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                acc_c += w[i]*c[i];
+                acc_m += w[n_embd + i]*m[i];
+            }
+            d[r] = acc_c*rc + acc_m*rm;
+            o[n_embd + r]        = acc_c;
+            o[n_embd + rank + r] = acc_m;
+        }
+
+        for (int64_t j = 0; j < n_embd; ++j) {
+            const float * wg = (const float *) ((const char *) gain->data   + j*gain->nb[1]);
+            const float * wf = (const float *) ((const char *) forget->data + j*forget->nb[1]);
+            float g = 0.0f, f = 0.0f;
+            for (int64_t r = 0; r < rank; ++r) {
+                g += wg[r]*d[r];
+                f += wf[r]*d[r];
+            }
+            o[j] = c[j] - tanhf(f)*c[j] + tanhf(g)*m[j];
+        }
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_post
 
 static void ggml_compute_forward_dsv4_hc_post_f32(

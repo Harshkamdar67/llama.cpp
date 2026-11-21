@@ -4778,6 +4778,60 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_INKLING_LOOP_GATE
+struct test_inkling_loop_gate : public test_case {
+    const int64_t n_embd;
+    const int64_t rank;
+    const int64_t n_tokens;
+    const bool    strided; // cur and msg as row views of wider tensors, as the model passes them
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_LOOP_GATE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, rank, n_tokens, strided);
+    }
+
+    test_inkling_loop_gate(int64_t n_embd = 64, int64_t rank = 8, int64_t n_tokens = 3, bool strided = false)
+        : n_embd(n_embd), rank(rank), n_tokens(n_tokens), strided(strided) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // small weights keep the tanh arguments out of saturation, so an error in d still shows
+            const bool weight = strncmp(t->name, "w_", 2) == 0;
+            init_tensor_uniform(t, weight ? -0.1f : -1.0f, weight ? 0.1f : 1.0f);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur;
+        ggml_tensor * msg;
+        if (strided) {
+            ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 3, n_tokens);
+            ggml_set_name(a, "a");
+            cur = ggml_view_2d(ctx, a, n_embd, n_tokens, a->nb[2], 1*a->nb[1]);
+            msg = ggml_view_2d(ctx, a, n_embd, n_tokens, a->nb[2], 2*a->nb[1]);
+        } else {
+            cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            msg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(cur, "cur");
+            ggml_set_name(msg, "msg");
+        }
+        ggml_tensor * down   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*n_embd, rank);
+        ggml_tensor * gain   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, n_embd);
+        ggml_tensor * forget = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, n_embd);
+        ggml_set_name(down,   "w_down");
+        ggml_set_name(gain,   "w_gain");
+        ggml_set_name(forget, "w_forget");
+
+        ggml_tensor * out = ggml_inkling_loop_gate(ctx, cur, msg, down, gain, forget, 1e-6f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_hc;
@@ -10810,6 +10864,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    test_cases.emplace_back(new test_inkling_loop_gate(64, 8, 1, false));
+    test_cases.emplace_back(new test_inkling_loop_gate(64, 8, 3, true));
+    test_cases.emplace_back(new test_inkling_loop_gate(2304, 64, 1, false));
+    test_cases.emplace_back(new test_inkling_loop_gate(2304, 64, 4, true));
+    test_cases.emplace_back(new test_inkling_loop_gate(2304, 64, 33, true));
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));

@@ -1,0 +1,115 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Inkling 2 loop message gate in two passes, column t of dst = [result (n_embd); A (rank); B (rank)]:
+//   pass 0, workgroup (r, t):      A[r] = down[r, :n_embd] . cur,  B[r] = down[r, n_embd:] . msg
+//   pass 1, workgroup (block, t):  d = A/rms(cur) + B/rms(msg)
+//                                  result = cur*(1 - tanh(forget*d)) + tanh(gain*d)*msg
+// The norms commute with the down projection, so pass 0 needs no per-token reduction first.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint PASS = 0;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_embd;
+    uint rank;
+    uint nbc1;      // cur row stride, elements
+    uint nbm1;      // msg row stride, elements
+    uint nbd1;      // dst row stride, elements
+
+    uint c_offset;
+    uint m_offset;
+    uint w_offset;  // down
+    uint g_offset;  // gain
+    uint f_offset;  // forget
+    uint d_offset;
+
+    float eps;
+};
+
+layout(binding = 0) readonly buffer C { float data_c[]; };
+layout(binding = 1) readonly buffer M { float data_m[]; };
+layout(binding = 2) readonly buffer W { float data_w[]; };
+layout(binding = 3) readonly buffer G { float data_g[]; };
+layout(binding = 4) readonly buffer F { float data_f[]; };
+layout(binding = 5)          buffer D { float data_d[]; };
+
+const uint MAX_RANK = 128;
+
+shared float red[64];
+shared float dvec[MAX_RANK];
+
+float block_sum(float v) {
+    v = subgroupAdd(v);
+    if (subgroupElect()) {
+        red[gl_SubgroupID] = v;
+    }
+    barrier();
+    float s = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; ++i) {
+        s += red[i];
+    }
+    barrier();
+    return s;
+}
+
+void main() {
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint t     = gl_WorkGroupID.y;
+    const uint c_row = c_offset + t*nbc1;
+    const uint m_row = m_offset + t*nbm1;
+    const uint d_col = d_offset + t*nbd1;
+
+    if (PASS == 0) {
+        const uint r     = gl_WorkGroupID.x;
+        const uint w_row = w_offset + r*2*n_embd;
+        float a = 0.0, b = 0.0;
+        for (uint i = tid; i < n_embd; i += BLOCK_SIZE) {
+            a += data_w[w_row + i]*data_c[c_row + i];
+            b += data_w[w_row + n_embd + i]*data_m[m_row + i];
+        }
+        a = block_sum(a);
+        b = block_sum(b);
+        if (tid == 0) {
+            data_d[d_col + n_embd + r]        = a;
+            data_d[d_col + n_embd + rank + r] = b;
+        }
+        return;
+    }
+
+    float sc = 0.0, sm = 0.0;
+    for (uint i = tid; i < n_embd; i += BLOCK_SIZE) {
+        const float c = data_c[c_row + i];
+        const float m = data_m[m_row + i];
+        sc += c*c;
+        sm += m*m;
+    }
+    const float rc = inversesqrt(block_sum(sc)/float(n_embd) + eps);
+    const float rm = inversesqrt(block_sum(sm)/float(n_embd) + eps);
+
+    for (uint r = tid; r < rank; r += BLOCK_SIZE) {
+        dvec[r] = data_d[d_col + n_embd + r]*rc + data_d[d_col + n_embd + rank + r]*rm;
+    }
+    barrier();
+
+    const uint j = gl_WorkGroupID.x*BLOCK_SIZE + tid;
+    if (j >= n_embd) {
+        return;
+    }
+    const uint g_row = g_offset + j*rank;
+    const uint f_row = f_offset + j*rank;
+    float g = 0.0, f = 0.0;
+    for (uint r = 0; r < rank; ++r) {
+        g += data_g[g_row + r]*dvec[r];
+        f += data_f[f_row + r]*dvec[r];
+    }
+    const float c = data_c[c_row + j];
+    const float m = data_m[m_row + j];
+    data_d[d_col + j] = c - tanh(f)*c + tanh(g)*m;
+}

@@ -275,6 +275,14 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
+    // a few tokens (decode, a draft verify): one fused op instead of a dozen small ones; it rereads the rank-64
+    // matrices per token, so a long prompt keeps the matmuls. LLAMA_INKLING_NO_FUSE=1 keeps the unfused graph.
+    static const bool no_fuse = getenv("LLAMA_INKLING_NO_FUSE") != nullptr;
+    if (!no_fuse && n_tokens <= 16 && (!loras || loras->empty()) && loop.ctrl_down[ctrl]->type == GGML_TYPE_F32 &&
+            loop.ctrl_gain[ctrl]->type == GGML_TYPE_F32 && loop.ctrl_forget[ctrl]->type == GGML_TYPE_F32) {
+        return ggml_inkling_loop_gate(ctx0, cur, message, loop.ctrl_down[ctrl], loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl], 1e-6f);
+    }
+
     ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
