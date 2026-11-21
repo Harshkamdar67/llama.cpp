@@ -1101,6 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "TOP_K_MASK",
     "INKLING_LOOP_GATE",
     "INKLING_REL_MASK",
+    "INKLING_MIX",
 
     "UNARY",
 
@@ -1120,7 +1121,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1218,6 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "inkling_loop_gate(cur, msg, down, gain, forget)",
     "inkling_rel_mask(r, bias, sinks, rel_pos, mask)",
+    "inkling_mix(query, cur, blocks...)",
 
     "unary(x)",
 
@@ -1237,7 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6526,6 +6528,39 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * gate,
         float                 scale) {
     return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+}
+
+// ggml_inkling_mix
+
+struct ggml_tensor * ggml_inkling_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * query,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor ** blocks,
+        int                   n_blocks) {
+    const int64_t n_embd = cur->ne[0];
+
+    GGML_ASSERT(n_blocks >= 0 && n_blocks <= GGML_MAX_SRC - 2);
+    GGML_ASSERT(query->type == GGML_TYPE_F32 && cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(query->ne[0] == n_embd && ggml_is_contiguous(query));
+    GGML_ASSERT(cur->nb[0] == sizeof(float) && cur->ne[2] == 1 && cur->ne[3] == 1);
+    for (int i = 0; i < n_blocks; ++i) {
+        GGML_ASSERT(blocks[i]->type == GGML_TYPE_F32);
+        GGML_ASSERT(blocks[i]->ne[0] == n_embd && blocks[i]->ne[1] == cur->ne[1] && blocks[i]->nb[0] == sizeof(float));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, query->ne[1], cur->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, n_blocks);
+
+    result->op     = GGML_OP_INKLING_MIX;
+    result->src[0] = query;
+    result->src[1] = cur;
+    for (int i = 0; i < n_blocks; ++i) {
+        result->src[2 + i] = blocks[i];
+    }
+
+    return result;
 }
 
 // ggml_inkling_rel_mask

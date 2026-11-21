@@ -192,6 +192,17 @@ ggml_tensor * llama_model_inkling2::graph::stack(const std::vector<ggml_tensor *
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 // the softmax is over the set of states, so their order does not matter
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+    static const bool no_fuse = getenv("LLAMA_INKLING_NO_FUSE") != nullptr;
+    if (!no_fuse && n_tokens > 1 && blocks.size() <= 8 && query->ne[1] <= 4) {
+        // norms, scores, softmax and the weighted sum in one op, one workgroup per token; with a single token the
+        // separate ops spread over more of the GPU and are faster (B60: 37.4 vs 36.5 tok/s)
+        ggml_tensor * b[8];
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            b[i] = ggml_reshape_2d(ctx0, blocks[i], n_embd, n_tokens);
+        }
+        return ggml_inkling_mix(ctx0, query, ggml_reshape_2d(ctx0, cur, n_embd, n_tokens), b, (int) blocks.size());
+    }
+
     ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     if (ggml_tensor * prev = stack(blocks)) {
         states = ggml_concat(ctx0, prev, states, 1);

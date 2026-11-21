@@ -4778,6 +4778,49 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_INKLING_MIX
+struct test_inkling_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t n_query;
+    const int64_t n_tokens;
+    const int     n_blocks;
+    const bool    strided; // cur as a column view of a wider tensor
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, n_query, n_tokens, n_blocks, strided);
+    }
+
+    test_inkling_mix(int64_t n_embd = 64, int64_t n_query = 1, int64_t n_tokens = 3, int n_blocks = 2, bool strided = false)
+        : n_embd(n_embd), n_query(n_query), n_tokens(n_tokens), n_blocks(n_blocks), strided(strided) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_query);
+        ggml_set_name(query, "query");
+        ggml_tensor * cur;
+        if (strided) {
+            ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 3, n_tokens);
+            ggml_set_name(a, "a");
+            cur = ggml_view_2d(ctx, a, n_embd, n_tokens, a->nb[2], a->nb[1]);
+        } else {
+            cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(cur, "cur");
+        }
+        ggml_tensor * blocks[8];
+        for (int i = 0; i < n_blocks; ++i) {
+            blocks[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_format_name(blocks[i], "block%d", i);
+        }
+        ggml_tensor * out = ggml_inkling_mix(ctx, query, cur, blocks, n_blocks);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_INKLING_REL_MASK
 struct test_inkling_rel_mask : public test_case {
     const int64_t n_rel;
@@ -10920,6 +10963,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    test_cases.emplace_back(new test_inkling_mix(64, 1, 1, 0, false));
+    test_cases.emplace_back(new test_inkling_mix(64, 1, 3, 2, true));
+    test_cases.emplace_back(new test_inkling_mix(2304, 1, 1, 4, false));
+    test_cases.emplace_back(new test_inkling_mix(2304, 3, 4, 3, true));
+    test_cases.emplace_back(new test_inkling_mix(2304, 4, 33, 4, false));
     test_cases.emplace_back(new test_inkling_rel_mask(16, 4, 32, 64, 2, 1));
     test_cases.emplace_back(new test_inkling_rel_mask(16, 24, 1024, 1536, 1, 1));
     test_cases.emplace_back(new test_inkling_rel_mask(16, 24, 1024, 4096, 7, 1));

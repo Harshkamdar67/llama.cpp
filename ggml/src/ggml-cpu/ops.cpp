@@ -11562,6 +11562,66 @@ void ggml_compute_forward_dsv4_hc_pre(
     }
 }
 
+// ggml_compute_forward_inkling_mix
+
+void ggml_compute_forward_inkling_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * query = dst->src[0];
+    const int n_blocks = ggml_get_op_params_i32(dst, 0);
+    const int n_states = n_blocks + 1;
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_query  = dst->ne[1];
+    const int64_t n_tokens = dst->ne[2];
+
+    // state i: the blocks in order, then cur
+    const ggml_tensor * states[GGML_MAX_SRC];
+    for (int i = 0; i < n_blocks; ++i) {
+        states[i] = dst->src[2 + i];
+    }
+    states[n_blocks] = dst->src[1];
+
+    std::vector<float> rinv(n_states), w(n_states);
+
+    for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
+        const float * s[GGML_MAX_SRC];
+        for (int i = 0; i < n_states; ++i) {
+            s[i] = (const float *) ((const char *) states[i]->data + t*states[i]->nb[1]);
+            ggml_float ss = 0.0;
+            for (int64_t e = 0; e < n_embd; ++e) {
+                ss += (ggml_float) s[i][e]*s[i][e];
+            }
+            rinv[i] = 1.0f/sqrtf((float) (ss/n_embd) + 1e-6f);
+        }
+        for (int64_t q = 0; q < n_query; ++q) {
+            const float * qv = (const float *) ((const char *) query->data + q*query->nb[1]);
+            float mx = -INFINITY;
+            for (int i = 0; i < n_states; ++i) {
+                float dot = 0.0f;
+                for (int64_t e = 0; e < n_embd; ++e) {
+                    dot += qv[e]*s[i][e];
+                }
+                w[i] = dot*rinv[i]/sqrtf((float) n_embd);
+                mx = std::max(mx, w[i]);
+            }
+            float sum = 0.0f;
+            for (int i = 0; i < n_states; ++i) {
+                w[i] = expf(w[i] - mx);
+                sum += w[i];
+            }
+            float * o = (float *) ((char *) dst->data + q*dst->nb[1] + t*dst->nb[2]);
+            for (int64_t e = 0; e < n_embd; ++e) {
+                float acc = 0.0f;
+                for (int i = 0; i < n_states; ++i) {
+                    acc += w[i]*rinv[i]*s[i][e];
+                }
+                o[e] = acc/sum;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_inkling_rel_mask
 
 void ggml_compute_forward_inkling_rel_mask(
