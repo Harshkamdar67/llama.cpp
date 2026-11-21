@@ -6128,6 +6128,22 @@ void ggml_vk_instance_init() {
             return;
         }
     }
+
+    // GGML_VK_DEVICE_NAME keeps only the devices whose name contains it: with several GPUs on Windows the
+    // enumeration order, and so every device index, can differ from one process to the next
+    if (const char * name_env = getenv("GGML_VK_DEVICE_NAME")) {
+        std::vector<size_t> kept;
+        for (size_t idx : vk_instance.device_indices) {
+            if (std::string(devices[idx].getProperties().deviceName.data()).find(name_env) != std::string::npos) {
+                kept.push_back(idx);
+            }
+        }
+        if (kept.empty()) {
+            GGML_LOG_WARN("ggml_vulkan: no device name contains GGML_VK_DEVICE_NAME=%s, keeping all\n", name_env);
+        } else {
+            vk_instance.device_indices = kept;
+        }
+    }
     GGML_LOG_DEBUG("ggml_vulkan: Found %zu Vulkan devices:\n", vk_instance.device_indices.size());
 
     size_t host_buffer_import_count = 0;
@@ -10605,8 +10621,14 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
         } break;
     case GGML_OP_GET_ROWS:
-        elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
-        elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+        if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_I32) {
+            // get_rows.comp spreads (row, column) over x; it loops when x is capped
+            const uint64_t n = (uint64_t) ne00 * ne10;
+            elements = { (uint32_t) std::min<uint64_t>(n, 512ull * ctx->device->properties.limits.maxComputeWorkGroupCount[0]), 1, (uint32_t)(ne11 * ne12) };
+        } else {
+            elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
+            elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+        }
         elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
         break;
     case GGML_OP_GET_ROWS_BACK:
