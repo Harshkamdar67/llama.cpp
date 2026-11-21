@@ -2537,8 +2537,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
     }
-    if (w_scale != 0.0f && w_scale != 1.0f) {
-        weights = ggml_scale(ctx0, weights, w_scale);
+    // situ's outer factors beta*lb pass linearly through the down projection, so they can go with the router weights
+    // (not with a down bias, a post-expert norm or weights applied before the FFN)
+    const bool  situ_fold = type_op == LLM_FFN_SITU && !weight_before_ffn && !post_exp_norm && !down_exps_b;
+    const float situ_k    = situ_fold ? hparams.situ_beta*(hparams.situ_linear_beta > 0.0f ? hparams.situ_linear_beta : 1.0f) : 1.0f;
+    const float w_scale_k = (w_scale != 0.0f ? w_scale : 1.0f)*situ_k;
+    if (w_scale_k != 1.0f) {
+        weights = ggml_scale(ctx0, weights, w_scale_k);
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
@@ -2670,10 +2675,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
-                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
+                    ggml_tensor * act = ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta));
+                    if (!situ_fold) {
+                        act = ggml_scale(ctx0, act, beta);
+                    }
                     act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
                     if (lb > 0.0f) {
-                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
+                        up = ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb));
+                        if (!situ_fold) {
+                            up = ggml_scale(ctx0, up, lb);
+                        }
                     }
                     cur = ggml_mul(ctx0, act, up);
                     cb(cur, "ffn_moe_situ", il);
