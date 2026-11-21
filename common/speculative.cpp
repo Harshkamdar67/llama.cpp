@@ -1530,6 +1530,7 @@ public:
 
             // DSpark: read from the first draft slot, truncate below the confidence threshold
             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+            const int32_t n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
             // bonus-anchor drafts read the mask positions only, like DFlash
             for (int32_t i = i_draft_beg; i < i_draft_beg + params.n_max; ++i) {
                 const int32_t idx = beg + i;
@@ -1538,13 +1539,22 @@ public:
                     break;
                 }
 
-                const llama_token sampled = common_sampler_sample(smpl, ctx_dft, idx, true);
                 if (has_rnn_context) {
-                    // Use the first maximum, as in the RNN conditioning graph.
+                    // Use the first maximum, as in the RNN conditioning graph. The drafter samples greedily, so read the
+                    // argmax from the logits: building the sampler's candidate list costs milliseconds at a 200K vocabulary.
+                    const float * logits = llama_get_logits_ith(ctx_dft, idx);
+                    llama_token sampled = 0;
+                    for (int32_t v = 1; v < n_vocab_dft; ++v) {
+                        if (logits[v] > logits[sampled]) {
+                            sampled = v;
+                        }
+                    }
                     common_sampler_accept(smpl, sampled, true);
                     result.push_back(sampled);
                     continue;
                 }
+
+                common_sampler_sample(smpl, ctx_dft, idx, true);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
