@@ -1103,6 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "INKLING_REL_MASK",
     "INKLING_MIX",
     "INKLING_SITU",
+    "INKLING_CONV",
 
     "UNARY",
 
@@ -1122,7 +1123,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1222,6 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "inkling_rel_mask(r, bias, sinks, rel_pos, mask)",
     "inkling_mix(query, cur, blocks...)",
     "inkling_situ(x)",
+    "inkling_conv(cur, past, weight)",
 
     "unary(x)",
 
@@ -1241,7 +1243,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6530,6 +6532,40 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * gate,
         float                 scale) {
     return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+}
+
+// ggml_inkling_conv
+
+struct ggml_tensor * ggml_inkling_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * past,
+        struct ggml_tensor  * weight,
+        float                 scale) {
+    const int64_t n_ch     = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+    const int64_t n_hist   = past->ne[0];
+    const int64_t n_seqs   = past->ne[2];
+
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && past->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(cur->nb[0] == sizeof(float) && cur->ne[2] == 1 && cur->ne[3] == 1);
+    GGML_ASSERT(past->ne[1] == n_ch && past->nb[0] == sizeof(float));
+    GGML_ASSERT(weight->ne[0] == n_hist + 1 && weight->ne[1] == n_ch && ggml_is_contiguous(weight));
+    GGML_ASSERT(n_tokens % n_seqs == 0);
+
+    const int64_t n_x = (n_hist + n_tokens/n_seqs)*n_ch*n_seqs;
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_ch*n_tokens + n_x);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_ch);
+    ggml_set_op_params_i32(result, 2, (int32_t) n_tokens);
+
+    result->op     = GGML_OP_INKLING_CONV;
+    result->src[0] = cur;
+    result->src[1] = past;
+    result->src[2] = weight;
+
+    return result;
 }
 
 // ggml_inkling_situ

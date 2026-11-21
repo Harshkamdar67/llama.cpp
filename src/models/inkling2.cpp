@@ -256,6 +256,18 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
+    static const bool no_fuse = getenv("LLAMA_INKLING_NO_FUSE") != nullptr;
+    if (!no_fuse && !dynamic && weight->type == GGML_TYPE_F32) {
+        // the convolution, its residual and scale in one op, which also writes [past; cur] for the state store
+        const float scale = scaled ? 1.0f/sqrtf(n_conv + 1) : 1.0f;
+        ggml_tensor * r   = ggml_inkling_conv(ctx0, ggml_reshape_2d(ctx0, cur, n_channels, n_tokens), past, weight, scale);
+        const int64_t n_time = n_conv - 1 + n_seq_tokens;
+        ggml_tensor * x = ggml_view_3d(ctx0, r, n_time, n_channels, n_seqs, n_time*sizeof(float), n_time*n_channels*sizeof(float),
+                n_channels*n_tokens*sizeof(float));
+        build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+        return ggml_view_2d(ctx0, r, n_channels, n_tokens, n_channels*sizeof(float), 0);
+    }
+
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
     x = ggml_concat(ctx0, past, x, 0);
 

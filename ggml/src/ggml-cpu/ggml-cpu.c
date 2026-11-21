@@ -2133,6 +2133,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_inkling_situ(params, tensor);
             } break;
+        case GGML_OP_INKLING_CONV:
+            {
+                ggml_compute_forward_inkling_conv(params, tensor);
+            } break;
         case GGML_OP_TOP_K_MASK:
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
@@ -2324,6 +2328,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_INKLING_REL_MASK:
         case GGML_OP_INKLING_MIX:
         case GGML_OP_INKLING_SITU:
+        case GGML_OP_INKLING_CONV:
             {
                 n_tasks = n_threads;
             } break;

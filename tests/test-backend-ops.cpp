@@ -4778,6 +4778,40 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_INKLING_CONV
+struct test_inkling_conv : public test_case {
+    const int64_t n_ch;
+    const int64_t n_tokens;
+    const int64_t n_seqs;
+    const float   scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_CONV";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_ch, n_tokens, n_seqs, scale);
+    }
+
+    test_inkling_conv(int64_t n_ch = 64, int64_t n_tokens = 3, int64_t n_seqs = 1, float scale = 1.0f)
+        : n_ch(n_ch), n_tokens(n_tokens), n_seqs(n_seqs), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_tokens);
+        // the history as the model passes it: a view of a wider state, offset by other channels
+        ggml_tensor * hist = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, n_ch + 16, n_seqs);
+        ggml_tensor * w    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, n_ch);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(hist, "hist");
+        ggml_set_name(w, "w");
+        ggml_tensor * past = ggml_view_3d(ctx, hist, 3, n_ch, n_seqs, hist->nb[1], hist->nb[2], 16*hist->nb[1]);
+        ggml_tensor * out = ggml_inkling_conv(ctx, cur, past, w, scale);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_INKLING_SITU
 struct test_inkling_situ : public test_case {
     const std::array<int64_t, 4> ne; // of the result
@@ -10996,6 +11030,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    test_cases.emplace_back(new test_inkling_conv(64, 1, 1, 1.0f));
+    test_cases.emplace_back(new test_inkling_conv(1024, 4, 1, 1.0f));
+    test_cases.emplace_back(new test_inkling_conv(2304, 2, 2, 0.447f));
+    test_cases.emplace_back(new test_inkling_conv(2304, 37, 1, 0.447f));
     test_cases.emplace_back(new test_inkling_situ({64, 8, 3, 1}, 4.0f, 1.0f));
     test_cases.emplace_back(new test_inkling_situ({1152, 8, 1, 1}, 4.0f, 8.0f));
     test_cases.emplace_back(new test_inkling_situ({1152, 8, 37, 1}, 0.0f, 1.0f));

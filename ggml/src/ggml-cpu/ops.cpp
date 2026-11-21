@@ -11562,6 +11562,47 @@ void ggml_compute_forward_dsv4_hc_pre(
     }
 }
 
+// ggml_compute_forward_inkling_conv
+
+void ggml_compute_forward_inkling_conv(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * cur    = dst->src[0];
+    const ggml_tensor * past   = dst->src[1];
+    const ggml_tensor * weight = dst->src[2];
+
+    const float   scale    = ggml_get_op_params_f32(dst, 0);
+    const int64_t n_ch     = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+    const int64_t n_hist   = past->ne[0];
+    const int64_t n_seqs   = past->ne[2];
+    const int64_t n_st     = n_tokens/n_seqs;
+    const int64_t n_time   = n_hist + n_st;
+
+    float * out = (float *) dst->data;
+    float * x   = out + n_ch*n_tokens;
+    const float * w = (const float *) weight->data;
+
+    for (int64_t c = params->ith; c < n_ch; c += params->nth) {
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            float * xs = x + n_time*(c + n_ch*s);
+            for (int64_t j = 0; j < n_hist; ++j) {
+                xs[j] = *(const float *) ((const char *) past->data + j*past->nb[0] + c*past->nb[1] + s*past->nb[2]);
+            }
+            for (int64_t t = 0; t < n_st; ++t) {
+                xs[n_hist + t] = *(const float *) ((const char *) cur->data + c*cur->nb[0] + (s*n_st + t)*cur->nb[1]);
+            }
+            for (int64_t t = 0; t < n_st; ++t) {
+                float acc = xs[n_hist + t];
+                for (int64_t k = 0; k <= n_hist; ++k) {
+                    acc += w[k + (n_hist + 1)*c]*xs[t + k];
+                }
+                out[c + n_ch*(s*n_st + t)] = scale*acc;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_inkling_situ
 
 void ggml_compute_forward_inkling_situ(

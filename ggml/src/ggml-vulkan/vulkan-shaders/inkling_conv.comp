@@ -1,0 +1,56 @@
+#version 450
+
+// Inkling 2 short causal convolution with its residual; also writes x = [past; cur] per sequence.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_ch;
+    uint n_tokens;
+    uint n_hist;
+    uint n_st;        // tokens per sequence
+    uint nbc1;        // cur token stride, elements
+    uint nbp1;        // past strides, elements
+    uint nbp2;
+    uint c_offset;
+    uint p_offset;
+    uint w_offset;
+    uint d_offset;
+    float scale;
+};
+
+layout(binding = 0) readonly  buffer C { float data_c[]; };
+layout(binding = 1) readonly  buffer P { float data_p[]; };
+layout(binding = 2) readonly  buffer W { float data_w[]; };
+layout(binding = 3) writeonly buffer D { float data_d[]; };
+
+float xs(uint c, uint s, uint j) {
+    return j < n_hist ? data_p[p_offset + j + c*nbp1 + s*nbp2] : data_c[c_offset + c + (s*n_st + j - n_hist)*nbc1];
+}
+
+void main() {
+    const uint c   = gl_GlobalInvocationID.x;
+    const uint tok = gl_GlobalInvocationID.y;
+    if (c >= n_ch || tok >= n_tokens) {
+        return;
+    }
+    const uint s = tok / n_st;
+    const uint t = tok % n_st;
+    const uint n_time = n_hist + n_st;
+
+    float acc = xs(c, s, n_hist + t);
+    for (uint k = 0; k <= n_hist; ++k) {
+        acc += data_w[w_offset + k + (n_hist + 1)*c]*xs(c, s, t + k);
+    }
+    data_d[d_offset + c + n_ch*tok] = scale*acc;
+
+    // x: this token's column, and the history once per sequence
+    const uint x_base = d_offset + n_ch*n_tokens + n_time*(c + n_ch*s);
+    data_d[x_base + n_hist + t] = xs(c, s, n_hist + t);
+    if (t == 0) {
+        for (uint j = 0; j < n_hist; ++j) {
+            data_d[x_base + j] = xs(c, s, j);
+        }
+    }
+}

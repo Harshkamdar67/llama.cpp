@@ -419,6 +419,7 @@ extern "C" {
         GGML_OP_INKLING_REL_MASK,
         GGML_OP_INKLING_MIX,
         GGML_OP_INKLING_SITU,
+        GGML_OP_INKLING_CONV,
 
         GGML_OP_UNARY,
 
@@ -2506,6 +2507,19 @@ extern "C" {
     //   d      = down * [rms_norm(cur, eps); rms_norm(msg, eps)]          (down: [2*n_embd, rank])
     //   result = cur*(1 - tanh(forget*d)) + tanh(gain*d)*msg              (gain, forget: [rank, n_embd])
     // cur and msg are [n_embd, n_tokens] with contiguous rows; the result is a view of [n_embd + 2*rank, n_tokens]
+    // Inkling 2 short causal convolution with its residual, per sequence s and channel c:
+    //   x[:, c, s]   = [past[:, c, s]; cur[c, tokens of s]]                (n_conv - 1 + n_seq_tokens time steps)
+    //   out[c, t]    = scale*(cur[c, t] + sum_k weight[k, c]*x[t_s + k, c, s])
+    // cur: [n_ch, n_seq_tokens*n_seqs], past: [n_conv - 1, n_ch, n_seqs], weight: [n_conv, n_ch]
+    // The result is one flat tensor: out ([n_ch, n_tokens]) then x ([n_conv - 1 + n_seq_tokens, n_ch, n_seqs]),
+    // x being what the recurrent state is stored from.
+    GGML_API struct ggml_tensor * ggml_inkling_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * weight,
+            float                 scale);
+
     // Inkling 2 SITU activation of a fused gate/up tensor a = [gate (n_ff); up (n_ff)] per row:
     //   result = k * tanh(gate/beta)*sigmoid(gate) * (lb > 0 ? tanh(up/lb) : up),  k = scale
     // a: [2*n_ff, ...] with contiguous rows; result: [n_ff, ...] contiguous
