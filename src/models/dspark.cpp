@@ -980,8 +980,10 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     auto * attn = build_attn_inp_kv_iswa();
     const int64_t rank = model.dspark_markov_w1->ne[0];
     const int64_t ntarget = model.target_layer_ids.size();
+    // softmax every row once: a row view starts at row*ntarget floats, which backends that need aligned inputs reject
+    auto * fuse = ggml_soft_max(ctx0, model.dspark_fuse);
     const auto mix = [&](ggml_tensor * features, int row, ggml_tensor * norm) {
-        auto * weights = ggml_soft_max(ctx0, ggml_view_1d(ctx0, model.dspark_fuse, ntarget, row*model.dspark_fuse->nb[1]));
+        auto * weights = ggml_cont(ctx0, ggml_view_1d(ctx0, fuse, ntarget, row*fuse->nb[1]));
         auto * x = ggml_reshape_3d(ctx0, features, n_embd, ntarget, n_tokens);
         x = ggml_cont(ctx0, ggml_permute(ctx0, x, 1, 0, 2, 3));
         x = ggml_sum_rows(ctx0, ggml_mul(ctx0, x, weights));
