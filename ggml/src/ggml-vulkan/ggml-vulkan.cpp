@@ -8322,15 +8322,21 @@ void ggml_vk_inkling_rel_mask(ggml_backend_vk_context * ctx, vk_context& subctx,
     const vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, mask,    true);
     const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst,     true);
 
+    // for a batch, a workgroup covers as many heads as their bias rows fit in 8192 floats of shared memory, so the distances
+    // and the mask are read once per group of heads instead of once per head (B60, 128K keys: 341 -> 380 tok/s prompt
+    // reading). A few tokens keep one head per workgroup to fill the GPU.
+    const uint32_t n_head = (uint32_t) r->ne[1];
+    const uint32_t n_hpg  = r->ne[2] < 32 ? 1u : std::max(1u, std::min({n_head, 8u, 8192u / (uint32_t) bias->ne[1]}));
+
     vk_op_inkling_rel_mask_push_constants pc = {
-        (uint32_t) r->ne[0], (uint32_t) r->ne[1], (uint32_t) bias->ne[1], (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
+        (uint32_t) r->ne[0], n_head, (uint32_t) bias->ne[1], (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
         ggml_vk_nb_elem(sinks, 1), ggml_vk_nb_elem(mask, 1), ggml_vk_nb_elem(mask, 3),
-        ggml_vk_nb_elem(dst, 1), ggml_vk_nb_elem(dst, 2), ggml_vk_nb_elem(dst, 3),
+        ggml_vk_nb_elem(dst, 1), ggml_vk_nb_elem(dst, 2), ggml_vk_nb_elem(dst, 3), n_hpg,
         0, 0, 0, 0, 0, 0,
     };
     init_pushconst_tensor_offsets(ctx, pc, r, bias, sinks, rel_pos, dst);
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { r_buf, b_buf, s_buf, p_buf, m_buf, d_buf }, pc, { (uint32_t) r->ne[1], (uint32_t) r->ne[2], 1 });
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { r_buf, b_buf, s_buf, p_buf, m_buf, d_buf }, pc, { CEIL_DIV(n_head, n_hpg), (uint32_t) r->ne[2], 1 });
 }
 
 void ggml_vk_inkling_loop_gate(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {

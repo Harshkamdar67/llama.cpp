@@ -290,6 +290,7 @@ struct vk_op_inkling_rel_mask_push_constants {
     uint32_t nbd1;
     uint32_t nbd2;
     uint32_t nbd3;
+    uint32_t n_hpg;     // heads per workgroup
 
     uint32_t r_offset;
     uint32_t b_offset;
