@@ -192,7 +192,7 @@ ggml_tensor * llama_model_inkling2::graph::stack(const std::vector<ggml_tensor *
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 // the softmax is over the set of states, so their order does not matter
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
-    static const bool no_fuse = getenv("LLAMA_INKLING_NO_FUSE") != nullptr;
+    static const bool no_fuse = (getenv("LLAMA_INKLING_NO_FUSE") != nullptr || getenv("LLAMA_INKLING_NO_MIX") != nullptr);
     if (!no_fuse && blocks.size() <= 8 && query->ne[1] <= 4) {
         // norms, scores, softmax and the weighted sum in one op
         ggml_tensor * b[8];
@@ -256,7 +256,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
-    static const bool no_fuse = getenv("LLAMA_INKLING_NO_FUSE") != nullptr;
+    static const bool no_fuse = (getenv("LLAMA_INKLING_NO_FUSE") != nullptr || getenv("LLAMA_INKLING_NO_CONV") != nullptr);
     if (!no_fuse && !dynamic && weight->type == GGML_TYPE_F32) {
         // the convolution, its residual and scale in one op, which also writes [past; cur] for the state store
         const float scale = scaled ? 1.0f/sqrtf(n_conv + 1) : 1.0f;
@@ -303,7 +303,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
     // a few tokens (decode, a draft verify): one fused op instead of a dozen small ones; it rereads the rank-64
     // matrices per token, so a long prompt keeps the matmuls. LLAMA_INKLING_NO_FUSE=1 keeps the unfused graph.
-    static const bool no_fuse = getenv("LLAMA_INKLING_NO_FUSE") != nullptr;
+    static const bool no_fuse = (getenv("LLAMA_INKLING_NO_FUSE") != nullptr || getenv("LLAMA_INKLING_NO_GATE") != nullptr);
     if (!no_fuse && n_tokens <= 16 && (!loras || loras->empty()) && loop.ctrl_down[ctrl]->type == GGML_TYPE_F32 &&
             loop.ctrl_gain[ctrl]->type == GGML_TYPE_F32 && loop.ctrl_forget[ctrl]->type == GGML_TYPE_F32) {
         return ggml_inkling_loop_gate(ctx0, cur, message, loop.ctrl_down[ctrl], loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl], 1e-6f);
@@ -434,7 +434,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         ggml_tensor * mask_raw = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
-        static const bool no_fuse_mask = getenv("LLAMA_INKLING_NO_FUSE") != nullptr;
+        static const bool no_fuse_mask = (getenv("LLAMA_INKLING_NO_FUSE") != nullptr || getenv("LLAMA_INKLING_NO_MASK") != nullptr);
         ggml_tensor * kq_b = nullptr;
         if (!no_fuse_mask && cparams.flash_attn && mask_raw->type == GGML_TYPE_F16 && layer.attn_rel_bias->type == GGML_TYPE_F32) {
             // the whole per-head mask in one op, written once in F16: bias row by distance, minus the sink, plus the mask

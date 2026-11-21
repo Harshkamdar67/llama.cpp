@@ -2675,7 +2675,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
-                    static const bool no_fuse_situ = getenv("LLAMA_INKLING_NO_FUSE") != nullptr;
+                    static const bool no_fuse_situ = getenv("LLAMA_INKLING_NO_FUSE") != nullptr || getenv("LLAMA_INKLING_NO_SITU") != nullptr;
                     if (!no_fuse_situ && up && cur->op == GGML_OP_VIEW && up->op == GGML_OP_VIEW && cur->src[0] == up->src[0] &&
                             cur->view_offs == 0 && up->view_offs == cur->ne[0]*ggml_element_size(cur) &&
                             cur->src[0]->ne[0] == 2*cur->ne[0] && cur->src[0]->type == GGML_TYPE_F32) {

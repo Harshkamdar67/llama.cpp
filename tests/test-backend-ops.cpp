@@ -11046,6 +11046,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_inkling_rel_mask(16, 24, 1024, 1536, 1, 1));
     test_cases.emplace_back(new test_inkling_rel_mask(16, 24, 1024, 4096, 7, 1));
     test_cases.emplace_back(new test_inkling_rel_mask(16, 24, 1024, 1536, 8, 2));
+    test_cases.emplace_back(new test_inkling_rel_mask(16, 24, 1024, 4096, 512, 1));
     test_cases.emplace_back(new test_inkling_loop_gate(64, 8, 1, false));
     test_cases.emplace_back(new test_inkling_loop_gate(64, 8, 3, true));
     test_cases.emplace_back(new test_inkling_loop_gate(2304, 64, 1, false));
