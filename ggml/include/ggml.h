@@ -2508,6 +2508,7 @@ extern "C" {
     // Inkling 2 attention over the depth: states z = rms_norm(blocks..., cur) (no weight, eps 1e-6),
     //   result[:, q, t] = sum_i softmax_i(query[:, q] . z_i[:, t] / sqrt(n_embd)) z_i[:, t]
     // query: [n_embd, n_query], cur and each block: [n_embd, n_tokens] with contiguous rows, n_blocks <= 8
+    // the result is a view: each token column also holds 45 partial sums per 256-element slice
     GGML_API struct ggml_tensor * ggml_inkling_mix(
             struct ggml_context * ctx,
             struct ggml_tensor  * query,

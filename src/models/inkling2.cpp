@@ -193,9 +193,8 @@ ggml_tensor * llama_model_inkling2::graph::stack(const std::vector<ggml_tensor *
 // the softmax is over the set of states, so their order does not matter
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
     static const bool no_fuse = getenv("LLAMA_INKLING_NO_FUSE") != nullptr;
-    if (!no_fuse && n_tokens > 1 && blocks.size() <= 8 && query->ne[1] <= 4) {
-        // norms, scores, softmax and the weighted sum in one op, one workgroup per token; with a single token the
-        // separate ops spread over more of the GPU and are faster (B60: 37.4 vs 36.5 tok/s)
+    if (!no_fuse && blocks.size() <= 8 && query->ne[1] <= 4) {
+        // norms, scores, softmax and the weighted sum in one op
         ggml_tensor * b[8];
         for (size_t i = 0; i < blocks.size(); ++i) {
             b[i] = ggml_reshape_2d(ctx0, blocks[i], n_embd, n_tokens);
@@ -474,7 +473,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     cb(ffn_inp, "ffn_inp", il);
 
     // MoE
-    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query), n_embd, n_tokens);
+    cur = mix(blocks, cur, layer.ffn_res_query);
+    cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[2], 0); // one query; the fused result is strided
     if (messages) {
         cur = control(cur, message(LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
     }
@@ -508,7 +508,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 }
 
 void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
-    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
+    cur = mix(blocks, cur, model.output_res_query);
+    cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[2], 0); // one query; the fused result is strided
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     res->t_layer_inp[n_layer] = cur;
 

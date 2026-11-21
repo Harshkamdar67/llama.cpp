@@ -241,6 +241,8 @@ struct vk_op_inkling_mix_push_constants {
     uint32_t nbd2;
     uint32_t q_offset;
     uint32_t d_offset;
+    uint32_t scr_offset;
+    uint32_t n_slices;
     uint32_t nbs1[9];
     uint32_t s_offset[9];
 };

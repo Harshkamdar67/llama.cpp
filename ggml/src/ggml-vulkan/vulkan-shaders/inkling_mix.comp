@@ -4,28 +4,34 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-// Inkling 2 attention over the depth, one workgroup per token:
+// Inkling 2 attention over the depth, in two passes over slices of BLOCK_SIZE elements:
 //   z_i = rms_norm(state_i), w[q, i] = softmax_i(query_q . z_i / sqrt(n_embd)), out_q = sum_i w[q, i] z_i
-// states: the blocks (bindings 2..9) then cur (binding 1).
+//   pass 0, workgroup (slice, t): the slice's sums of squares and query dot products into scratch
+//   pass 1, workgroup (slice, t): add the slices up, softmax, write the slice of every output
+// states: the blocks (bindings 2..9) then cur (binding 1). The scratch of token t starts at d_offset + scr_offset + t*nbd2.
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint PASS = 0;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 const uint MAX_STATES = 9;
 const uint MAX_QUERY  = 4;
+const uint N_ACC      = MAX_STATES*(1 + MAX_QUERY);
 
 layout(push_constant) uniform parameter
 {
     uint n_embd;
     uint n_query;
     uint n_states;
-    uint nbq1;     // query column stride, elements
-    uint nbd1;     // dst strides, elements
+    uint nbq1;        // query column stride, elements
+    uint nbd1;        // dst strides, elements
     uint nbd2;
     uint q_offset;
     uint d_offset;
-    uint nbs1[MAX_STATES];      // row stride of each state, elements
+    uint scr_offset;  // scratch, elements from the start of a token's column
+    uint n_slices;
+    uint nbs1[MAX_STATES];
     uint s_offset[MAX_STATES];
 };
 
@@ -39,9 +45,8 @@ layout(binding = 6)  readonly buffer S5 { float data_s5[]; };
 layout(binding = 7)  readonly buffer S6 { float data_s6[]; };
 layout(binding = 8)  readonly buffer S7 { float data_s7[]; };
 layout(binding = 9)  readonly buffer S8 { float data_s8[]; };
-layout(binding = 10) writeonly buffer D { float data_d[]; };
+layout(binding = 10)          buffer D  { float data_d[]; };
 
-// state i in host order: blocks 0..n_states-2 are bindings 2.., cur (the last state) is binding 1
 float load_state(uint i, uint t, uint e) {
     const uint idx = s_offset[i] + t*nbs1[i] + e;
     if (i == n_states - 1) return data_s0[idx];
@@ -57,47 +62,51 @@ float load_state(uint i, uint t, uint e) {
     }
 }
 
-const uint N_ACC = MAX_STATES*(1 + MAX_QUERY);
-
 shared float red[N_ACC][32];
 shared float tot[N_ACC];
 shared float wgt[MAX_QUERY][MAX_STATES];
 
 void main() {
-    const uint tid = gl_LocalInvocationID.x;
-    const uint t   = gl_WorkGroupID.x;
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint slice = gl_WorkGroupID.x;
+    const uint t     = gl_WorkGroupID.y;
+    const uint e     = slice*BLOCK_SIZE + tid;
+    const uint scr   = d_offset + t*nbd2 + scr_offset;
 
-    // acc[i] = sum of squares of state i, acc[n_states*(1 + q) + i] = query_q . state_i
-    float acc[N_ACC];
-    [[unroll]] for (uint k = 0; k < N_ACC; ++k) {
-        acc[k] = 0.0;
+    float x[MAX_STATES];
+    [[unroll]] for (uint i = 0; i < MAX_STATES; ++i) {
+        x[i] = (i < n_states && e < n_embd) ? load_state(i, t, e) : 0.0;
     }
-    for (uint e = tid; e < n_embd; e += BLOCK_SIZE) {
+
+    if (PASS == 0) {
         float qv[MAX_QUERY];
         [[unroll]] for (uint q = 0; q < MAX_QUERY; ++q) {
-            qv[q] = q < n_query ? data_q[q_offset + q*nbq1 + e] : 0.0;
+            qv[q] = (q < n_query && e < n_embd) ? data_q[q_offset + q*nbq1 + e] : 0.0;
         }
-        [[unroll]] for (uint i = 0; i < MAX_STATES; ++i) {
-            if (i < n_states) {
-                const float x = load_state(i, t, e);
-                acc[i] += x*x;
-                [[unroll]] for (uint q = 0; q < MAX_QUERY; ++q) {
-                    acc[MAX_STATES*(1 + q) + i] += qv[q]*x;
-                }
+        // k = i: sum of squares of state i; k = MAX_STATES*(1 + q) + i: query_q . state_i
+        [[unroll]] for (uint k = 0; k < N_ACC; ++k) {
+            const uint i = k % MAX_STATES;
+            const uint q = k / MAX_STATES;
+            const float v = subgroupAdd(q == 0 ? x[i]*x[i] : qv[q - 1]*x[i]);
+            if (subgroupElect()) {
+                red[k][gl_SubgroupID] = v;
             }
         }
-    }
-    [[unroll]] for (uint k = 0; k < N_ACC; ++k) {
-        const float v = subgroupAdd(acc[k]);
-        if (subgroupElect()) {
-            red[k][gl_SubgroupID] = v;
+        barrier();
+        if (tid < N_ACC) {
+            float s = 0.0;
+            for (uint g = 0; g < gl_NumSubgroups; ++g) {
+                s += red[tid][g];
+            }
+            data_d[scr + slice*N_ACC + tid] = s;
         }
+        return;
     }
-    barrier();
+
     if (tid < N_ACC) {
         float s = 0.0;
-        for (uint g = 0; g < gl_NumSubgroups; ++g) {
-            s += red[tid][g];
+        for (uint c = 0; c < n_slices; ++c) {
+            s += data_d[scr + c*N_ACC + tid];
         }
         tot[tid] = s;
     }
@@ -106,12 +115,11 @@ void main() {
     if (tid < n_query) {
         const uint q = tid;
         const float scale = inversesqrt(float(n_embd));
-        float mx = -1.0/0.0;
         float sc[MAX_STATES];
+        float mx = -1.0/0.0;
         [[unroll]] for (uint i = 0; i < MAX_STATES; ++i) {
             if (i < n_states) {
-                const float rinv = inversesqrt(tot[i]/float(n_embd) + 1e-6);
-                sc[i] = tot[MAX_STATES*(1 + q) + i]*rinv*scale;
+                sc[i] = tot[MAX_STATES*(1 + q) + i]*inversesqrt(tot[i]/float(n_embd) + 1e-6)*scale;
                 mx = max(mx, sc[i]);
             }
         }
@@ -124,18 +132,13 @@ void main() {
         }
         [[unroll]] for (uint i = 0; i < MAX_STATES; ++i) {
             if (i < n_states) {
-                // fold the state's norm into its weight
                 wgt[q][i] = sc[i]/sum*inversesqrt(tot[i]/float(n_embd) + 1e-6);
             }
         }
     }
     barrier();
 
-    for (uint e = tid; e < n_embd; e += BLOCK_SIZE) {
-        float x[MAX_STATES];
-        [[unroll]] for (uint i = 0; i < MAX_STATES; ++i) {
-            x[i] = i < n_states ? load_state(i, t, e) : 0.0;
-        }
+    if (e < n_embd) {
         for (uint q = 0; q < n_query; ++q) {
             float o = 0.0;
             [[unroll]] for (uint i = 0; i < MAX_STATES; ++i) {

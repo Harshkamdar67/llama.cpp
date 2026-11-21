@@ -6549,7 +6549,10 @@ struct ggml_tensor * ggml_inkling_mix(
         GGML_ASSERT(blocks[i]->ne[0] == n_embd && blocks[i]->ne[1] == cur->ne[1] && blocks[i]->nb[0] == sizeof(float));
     }
 
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, query->ne[1], cur->ne[1]);
+    // each token column: the result, then 45 partial sums (9 states x (1 + 4 queries)) per slice of 256 elements
+    const int64_t n_slices = (n_embd + 255)/256;
+    const int64_t n_col    = n_embd*query->ne[1] + n_slices*45;
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_col, cur->ne[1]);
 
     ggml_set_op_params_i32(result, 0, n_blocks);
 
@@ -6560,7 +6563,7 @@ struct ggml_tensor * ggml_inkling_mix(
         result->src[2 + i] = blocks[i];
     }
 
-    return result;
+    return ggml_view_3d(ctx, result, n_embd, query->ne[1], cur->ne[1], n_embd*sizeof(float), result->nb[1], 0);
 }
 
 // ggml_inkling_rel_mask
