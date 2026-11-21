@@ -1079,11 +1079,29 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     auto * tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
     tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
     auto * prev = ids;
+    // Each Markov step is a full-vocabulary product and an argmax over it, one after another. LLAMA_DSPARK_STEPS
+    // stops the chain after that many drafts: the later rows keep the base logits, which are not read when the
+    // server takes no more drafts than that (set it to --spec-draft-n-max). The drafts only steer what the target
+    // verifies, so the backend argmax is used; LLAMA_DSPARK_EXACT_TIES=1 keeps the first-maximum selection.
+    const char * steps_env = getenv("LLAMA_DSPARK_STEPS");
+    const int64_t n_steps  = steps_env ? std::min<int64_t>(block - 1, atoll(steps_env)) : block - 1;
+    const bool plain_argmax = getenv("LLAMA_DSPARK_EXACT_TIES") == nullptr;
     for (int64_t i = 1; i < block; ++i) {
+        if (i > n_steps) {
+            logits = ggml_concat(ctx0, logits, column(base, i), 1);
+            continue;
+        }
         auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
         logits = ggml_concat(ctx0, logits, col, 1);
-        // Select the first maximum, independent of backend argmax tie order.
+        if (i == n_steps) {
+            continue;
+        }
         auto * valid = ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
+        if (plain_argmax) {
+            prev = ggml_argmax(ctx0, valid);
+            continue;
+        }
+        // Select the first maximum, independent of backend argmax tie order.
         auto * maximum = ggml_pool_1d(ctx0, valid, GGML_OP_POOL_MAX, valid->ne[0], 1, 0);
         auto * is_max = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, maximum, valid), valid)), -1.0f, 1.0f);
         prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
