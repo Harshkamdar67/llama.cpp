@@ -418,6 +418,7 @@ extern "C" {
         GGML_OP_INKLING_LOOP_GATE,
         GGML_OP_INKLING_REL_MASK,
         GGML_OP_INKLING_MIX,
+        GGML_OP_INKLING_SITU,
 
         GGML_OP_UNARY,
 
@@ -2505,6 +2506,16 @@ extern "C" {
     //   d      = down * [rms_norm(cur, eps); rms_norm(msg, eps)]          (down: [2*n_embd, rank])
     //   result = cur*(1 - tanh(forget*d)) + tanh(gain*d)*msg              (gain, forget: [rank, n_embd])
     // cur and msg are [n_embd, n_tokens] with contiguous rows; the result is a view of [n_embd + 2*rank, n_tokens]
+    // Inkling 2 SITU activation of a fused gate/up tensor a = [gate (n_ff); up (n_ff)] per row:
+    //   result = k * tanh(gate/beta)*sigmoid(gate) * (lb > 0 ? tanh(up/lb) : up),  k = scale
+    // a: [2*n_ff, ...] with contiguous rows; result: [n_ff, ...] contiguous
+    GGML_API struct ggml_tensor * ggml_inkling_situ(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 beta,
+            float                 lb,
+            float                 scale);
+
     // Inkling 2 attention over the depth: states z = rms_norm(blocks..., cur) (no weight, eps 1e-6),
     //   result[:, q, t] = sum_i softmax_i(query[:, q] . z_i[:, t] / sqrt(n_embd)) z_i[:, t]
     // query: [n_embd, n_query], cur and each block: [n_embd, n_tokens] with contiguous rows, n_blocks <= 8

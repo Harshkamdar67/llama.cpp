@@ -1089,6 +1089,7 @@ void process_shaders() {
     string_to_spv("inkling_loop_gate_f32", "inkling_loop_gate.comp", {});
     string_to_spv("inkling_rel_mask_f16", "inkling_rel_mask.comp", {});
     string_to_spv("inkling_mix_f32", "inkling_mix.comp", {});
+    string_to_spv("inkling_situ_f32", "inkling_situ.comp", {});
     string_to_spv("top_k_mask_f16", "top_k_mask.comp", {{"MASK_TYPE", "uint16_t"}});
     string_to_spv("top_k_mask_f32", "top_k_mask.comp", {{"MASK_TYPE", "uint"}});
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

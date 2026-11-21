@@ -4778,6 +4778,39 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_INKLING_SITU
+struct test_inkling_situ : public test_case {
+    const std::array<int64_t, 4> ne; // of the result
+    const float lb;
+    const float scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_SITU";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, lb, scale);
+    }
+
+    test_inkling_situ(std::array<int64_t, 4> ne = {64, 8, 3, 1}, float lb = 4.0f, float scale = 1.0f)
+        : ne(ne), lb(lb), scale(scale) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -6.0f, 6.0f);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2*ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(a, "a");
+        ggml_tensor * out = ggml_inkling_situ(ctx, a, 2.0f, lb, scale);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_INKLING_MIX
 struct test_inkling_mix : public test_case {
     const int64_t n_embd;
@@ -10963,6 +10996,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    test_cases.emplace_back(new test_inkling_situ({64, 8, 3, 1}, 4.0f, 1.0f));
+    test_cases.emplace_back(new test_inkling_situ({1152, 8, 1, 1}, 4.0f, 8.0f));
+    test_cases.emplace_back(new test_inkling_situ({1152, 8, 37, 1}, 0.0f, 1.0f));
     test_cases.emplace_back(new test_inkling_mix(64, 1, 1, 0, false));
     test_cases.emplace_back(new test_inkling_mix(64, 1, 3, 2, true));
     test_cases.emplace_back(new test_inkling_mix(2304, 1, 1, 4, false));

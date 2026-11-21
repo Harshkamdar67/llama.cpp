@@ -1102,6 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "INKLING_LOOP_GATE",
     "INKLING_REL_MASK",
     "INKLING_MIX",
+    "INKLING_SITU",
 
     "UNARY",
 
@@ -1121,7 +1122,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1220,6 +1221,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "inkling_loop_gate(cur, msg, down, gain, forget)",
     "inkling_rel_mask(r, bias, sinks, rel_pos, mask)",
     "inkling_mix(query, cur, blocks...)",
+    "inkling_situ(x)",
 
     "unary(x)",
 
@@ -1239,7 +1241,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6528,6 +6530,31 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * gate,
         float                 scale) {
     return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+}
+
+// ggml_inkling_situ
+
+struct ggml_tensor * ggml_inkling_situ(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        float                 beta,
+        float                 lb,
+        float                 scale) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] % 2 == 0);
+    GGML_ASSERT(ggml_is_contiguous_rows(a));
+    GGML_ASSERT(beta > 0.0f);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, a->ne[0]/2, a->ne[1], a->ne[2], a->ne[3]);
+
+    ggml_set_op_params_f32(result, 0, beta);
+    ggml_set_op_params_f32(result, 1, lb);
+    ggml_set_op_params_f32(result, 2, scale);
+
+    result->op     = GGML_OP_INKLING_SITU;
+    result->src[0] = a;
+
+    return result;
 }
 
 // ggml_inkling_mix

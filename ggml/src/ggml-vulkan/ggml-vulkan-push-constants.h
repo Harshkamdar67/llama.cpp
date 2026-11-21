@@ -232,6 +232,21 @@ struct vk_op_dsv4_hc_pre_push_constants {
     float scale;
 };
 
+struct vk_op_inkling_situ_push_constants {
+    uint32_t n_ff;
+    uint32_t ne1;
+    uint32_t ne2;
+    uint32_t n_rows;
+    uint32_t nba1;
+    uint32_t nba2;
+    uint32_t nba3;
+    uint32_t a_offset;
+    uint32_t d_offset;
+    float beta;
+    float lb;
+    float scale;
+};
+
 struct vk_op_inkling_mix_push_constants {
     uint32_t n_embd;
     uint32_t n_query;

@@ -2675,6 +2675,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
+                    static const bool no_fuse_situ = getenv("LLAMA_INKLING_NO_FUSE") != nullptr;
+                    if (!no_fuse_situ && up && cur->op == GGML_OP_VIEW && up->op == GGML_OP_VIEW && cur->src[0] == up->src[0] &&
+                            cur->view_offs == 0 && up->view_offs == cur->ne[0]*ggml_element_size(cur) &&
+                            cur->src[0]->ne[0] == 2*cur->ne[0] && cur->src[0]->type == GGML_TYPE_F32) {
+                        // gate and up are the halves of one fused product: the whole activation in one op
+                        cur = ggml_inkling_situ(ctx0, cur->src[0], beta, lb, situ_fold ? 1.0f : beta*(lb > 0.0f ? lb : 1.0f));
+                        cb(cur, "ffn_moe_situ", il);
+                        break;
+                    }
                     ggml_tensor * act = ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta));
                     if (!situ_fold) {
                         act = ggml_scale(ctx0, act, beta);

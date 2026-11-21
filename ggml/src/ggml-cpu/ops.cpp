@@ -11562,6 +11562,35 @@ void ggml_compute_forward_dsv4_hc_pre(
     }
 }
 
+// ggml_compute_forward_inkling_situ
+
+void ggml_compute_forward_inkling_situ(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+
+    const float beta  = ggml_get_op_params_f32(dst, 0);
+    const float lb    = ggml_get_op_params_f32(dst, 1);
+    const float scale = ggml_get_op_params_f32(dst, 2);
+
+    const int64_t n_ff   = dst->ne[0];
+    const int64_t n_rows = ggml_nrows(dst);
+
+    for (int64_t r = params->ith; r < n_rows; r += params->nth) {
+        const int64_t i1 = r % dst->ne[1];
+        const int64_t i2 = (r / dst->ne[1]) % dst->ne[2];
+        const int64_t i3 = r / (dst->ne[1]*dst->ne[2]);
+        const float * g = (const float *) ((const char *) a->data + i1*a->nb[1] + i2*a->nb[2] + i3*a->nb[3]);
+        const float * u = g + n_ff;
+        float * o = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+        for (int64_t i = 0; i < n_ff; ++i) {
+            const float act = tanhf(g[i]/beta)/(1.0f + expf(-g[i]));
+            const float up  = lb > 0.0f ? tanhf(u[i]/lb) : u[i];
+            o[i] = scale*act*up;
+        }
+    }
+}
+
 // ggml_compute_forward_inkling_mix
 
 void ggml_compute_forward_inkling_mix(
