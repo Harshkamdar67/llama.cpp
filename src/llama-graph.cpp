@@ -4763,6 +4763,11 @@ void llm_graph_context::build_sampling() const {
             const int      i_out  = active ? 1       : 0;
 
             ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
+            if (logits_t->nb[1] % 256 != 0) {
+                // with a row size that is not a multiple of 256 bytes (an unpadded vocabulary) the row views start
+                // where some backends cannot bind a buffer; copy them, for every row so the graph keeps its topology
+                logits_seq = ggml_cont(ctx0, logits_seq);
+            }
             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
 
             struct llama_sampler_data data = {
