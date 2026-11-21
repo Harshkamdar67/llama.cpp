@@ -199,9 +199,13 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     states = ggml_rms_norm(ctx0, states, 1e-6f);
 
     ggml_tensor * scores;
-    if (query->ne[1] == 1) {
+    if (query->ne[1] == 1 && n_tokens == 1) {
         // one query: broadcast it over the tokens, and [1, n_states, n_tokens] has the layout of [n_states, 1, n_tokens]
         scores = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, query, states), states->ne[1], 1, n_tokens);
+    } else if (query->ne[1] == 1) {
+        // several tokens: the broadcast product takes a slow mat-vec path, a multiply and a row sum do not
+        scores = ggml_sum_rows(ctx0, ggml_mul(ctx0, states, query));
+        scores = ggml_reshape_3d(ctx0, scores, states->ne[1], 1, n_tokens);
     } else {
         ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
         scores = ggml_mul_mat(ctx0, states, queries);
