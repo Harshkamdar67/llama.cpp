@@ -3960,6 +3960,16 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        // generation first: while a slot is writing, the others read their prompts one ubatch at a time and only every
+        // (N + 1)-th iteration. Without it each written token waits behind up to n_batch prompt tokens of another
+        // slot (0.7 tok/s next to a 100K-token prompt at -b 2048). LLAMA_ARG_GEN_SHARE=N, 0 turns it off.
+        static const int gen_share = getenv("LLAMA_ARG_GEN_SHARE") ? atoi(getenv("LLAMA_ARG_GEN_SHARE")) : 8;
+        static int64_t gen_tick = 0;
+        int32_t n_batch_prompt = n_batch;
+        if (gen_share > 0 && !generating.empty()) {
+            n_batch_prompt = (++gen_tick % (gen_share + 1)) == 0 ? std::min(n_batch, (int32_t) batch.size() + n_ubatch) : 0;
+        }
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -4429,7 +4439,7 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_prompt) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
