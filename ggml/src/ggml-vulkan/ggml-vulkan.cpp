@@ -7566,7 +7566,7 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         }
 
         if (device->architecture == vk_device_architecture::INTEL_XE2 && device->driver_id == vk::DriverId::eIntelProprietaryWindows &&
-            k >= 2048 && src0_type == GGML_TYPE_IQ4_NL && !getenv("GGML_VK_XE2_OLD_MMVQ")) {
+            k >= 1024 && src0_type == GGML_TYPE_IQ4_NL && !getenv("GGML_VK_XE2_OLD_MMVQ")) {
             return true;
         }
 
