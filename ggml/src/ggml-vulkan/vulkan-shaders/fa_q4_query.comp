@@ -5,7 +5,7 @@
 
 // Flash attention over a long Q4_0 cache: the query of each head quantized to 8 bits, once.
 // Per query head, 40 values in the scratch: 32 words of four packed bytes, the sum of the bytes of each
-// block of 32 dims (the codes are value + 8), the scale, and 3 unused. One workgroup per query head.
+// block of 32 dims (the codes are value + 8), the scale, and 3 unused. One workgroup per token and query head.
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -13,9 +13,11 @@ const uint HS = 128;
 
 layout(push_constant) uniform parameter
 {
+    uint nbq1;       // elements between tokens
     uint nbq2;       // elements between query heads
     uint q_offset;
     uint off_q;
+    uint n_head_q;
 };
 
 layout(binding = 0) readonly buffer Q  { float   data_q[]; };
@@ -31,9 +33,9 @@ int q8(const float x, const float sc) {
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint hq  = gl_WorkGroupID.y;
+    const uint gq  = gl_WorkGroupID.y;   // token*n_head_q + head
 
-    qf[tid] = data_q[q_offset + hq*nbq2 + tid];
+    qf[tid] = data_q[q_offset + (gq / n_head_q)*nbq1 + (gq % n_head_q)*nbq2 + tid];
     barrier();
     if (tid == 0) {
         float mx = 1e-30;
@@ -45,7 +47,7 @@ void main() {
     barrier();
 
     const float sc = qsc;
-    const uint  qb = off_q + hq*40;
+    const uint  qb = off_q + gq*40;
     if (tid < HS/4) {
         const int a = q8(qf[4*tid], sc), b = q8(qf[4*tid + 1], sc), c = q8(qf[4*tid + 2], sc), d = q8(qf[4*tid + 3], sc);
         data_ti[qb + tid] = int32_t((uint(a) & 0xFFu) | ((uint(b) & 0xFFu) << 8) | ((uint(c) & 0xFFu) << 16) | ((uint(d) & 0xFFu) << 24));

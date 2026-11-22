@@ -234,9 +234,11 @@ struct vk_op_dsv4_hc_pre_push_constants {
 };
 
 struct vk_fa_q4_query_push_constants {
+    uint32_t nbq1;
     uint32_t nbq2;
     uint32_t q_offset;
     uint32_t off_q;
+    uint32_t n_head_q;
 };
 
 struct vk_fa_q4_scores_push_constants {
@@ -244,6 +246,10 @@ struct vk_fa_q4_scores_push_constants {
     uint32_t n_head_kv;
     uint32_t r;
     uint32_t nem2;
+    uint32_t nbm1;
+    uint32_t nbm2;
+    uint32_t n_tok;
+    uint32_t n_head_q;
     uint32_t m_offset;
     uint32_t s_stride;
     uint32_t n_wg;
@@ -262,6 +268,8 @@ struct vk_fa_q4_values_push_constants {
     uint32_t n_kv;
     uint32_t n_head_kv;
     uint32_t r;
+    uint32_t n_tok;
+    uint32_t n_head_q;
     uint32_t s_stride;
     uint32_t n_wg;
     uint32_t off_mg;
@@ -275,6 +283,7 @@ struct vk_fa_q4_reduce_push_constants {
     uint32_t off_p;
     uint32_t d_offset;
     uint32_t has_sinks;
+    uint32_t n_head_q;
 };
 
 struct vk_op_inkling_tag_mask_push_constants {

@@ -10,15 +10,15 @@
 // Flash attention for one query token over a long Q4_0 cache: the scores.
 // The cache codes are integers, so a key's dot product with a query quantized to 8 bits (fa_q4_query.comp)
 // is four multiply-adds per instruction; the 4-bit keys carry 16 times the rounding error the query adds.
-// Workgroup (block of KEYS keys, KV head): thread (key lane, query head) keeps its head's 32 query words
+// Workgroup (block of KEYS keys, KV head): thread (key lane, query slot) keeps its query's 32 words
 // and walks its keys, so nothing goes through shared memory until the block maximum at the end.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-const uint MAX_R = 4;      // query heads per KV head
+const uint MAX_Q = 8;      // query slots of a KV head: tokens x query heads per KV head
 const uint HS    = 128;
 const uint NB    = HS/32;
-const uint LANES = 256/MAX_R;
+const uint LANES = 256/MAX_Q;
 const float NEG  = -3.0e38;
 
 layout(constant_id = 0) const uint KEYS = 1024;   // keys per workgroup, a multiple of LANES
@@ -29,6 +29,10 @@ layout(push_constant) uniform parameter
     uint n_head_kv;
     uint r;
     uint nem2;
+    uint nbm1;       // mask strides, elements
+    uint nbm2;
+    uint n_tok;
+    uint n_head_q;
     uint m_offset;
     uint s_stride;   // scores per head (n_kv padded to KEYS)
     uint n_wg;
@@ -53,15 +57,17 @@ void main() {
     const uint tid  = gl_LocalInvocationID.x;
     const uint wg   = gl_WorkGroupID.x;
     const uint hk   = gl_WorkGroupID.y;
-    const uint h    = tid % MAX_R;
-    const uint lane = tid / MAX_R;
-    const uint hq   = hk*r + h;
+    const uint slot = tid % MAX_Q;
+    const uint lane = tid / MAX_Q;
+    const uint t    = slot / r;
+    const uint hq   = hk*r + slot % r;
+    const uint gq   = t*n_head_q + hq;
 
     float mx = NEG;
 
-    if (h < r) {
+    if (slot < n_tok*r) {
         // words 8b..8b+3 pair with the low nibbles of block b (its dims 0..15), 8b+4..8b+7 with the high ones
-        const uint qb = off_q + hq*40;
+        const uint qb = off_q + gq*40;
         int32_t qw[32];
         [[unroll]] for (uint j = 0; j < 32; ++j) {
             qw[j] = data_ti[qb + j];
@@ -71,12 +77,12 @@ void main() {
             qsum[b] = data_t[qb + 32 + b];
         }
         const float qsc  = data_t[qb + 36]*scale;
-        const uint  mrow = m_offset + (hq % nem2)*n_kv;
+        const uint  mrow = m_offset + t*nbm1 + (hq % nem2)*nbm2;
 
         for (uint it = 0; it < KEYS/LANES; ++it) {
             const uint key = wg*KEYS + lane + LANES*it;
             if (key >= n_kv) {
-                data_t[hq*s_stride + key] = NEG;
+                data_t[gq*s_stride + key] = NEG;
                 continue;
             }
             const uint ib0 = (key*n_head_kv + hk)*NB;
@@ -93,18 +99,18 @@ void main() {
                 s += float(data_k[ib].d)*(float(acc) - 8.0*qsum[b]);
             }
             s = s*qsc + float(data_m[mrow + key]);
-            data_t[hq*s_stride + key] = s;
+            data_t[gq*s_stride + key] = s;
             mx = max(mx, s);
         }
     }
 
     red[tid] = mx;
     barrier();
-    if (tid < r) {
+    if (tid < n_tok*r) {
         float m = NEG;
-        for (uint i = tid; i < 256; i += MAX_R) {
+        for (uint i = tid; i < 256; i += MAX_Q) {
             m = max(m, red[i]);
         }
-        data_t[off_mx + (hk*r + tid)*n_wg + wg] = m;
+        data_t[off_mx + ((tid / r)*n_head_q + hk*r + tid % r)*n_wg + wg] = m;
     }
 }

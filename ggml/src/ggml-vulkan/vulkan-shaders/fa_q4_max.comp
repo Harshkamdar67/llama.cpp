@@ -3,8 +3,8 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-// Flash attention over a long Q4_0 cache, phase 2 of 4: the largest score of each query head, from the
-// per-block maxima of phase 1. One workgroup per query head.
+// Flash attention over a long Q4_0 cache: the largest score of each query, from the
+// per-block maxima of the scores. One workgroup per token and query head.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 

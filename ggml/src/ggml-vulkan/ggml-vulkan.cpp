@@ -9321,6 +9321,8 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
     const int64_t n_kv      = k->ne[1];
     const int64_t n_head_kv = k->ne[2];
     const int64_t n_head_q  = q->ne[2];
+    const int64_t n_tok     = q->ne[1];
+    const int64_t n_q       = n_tok*n_head_q;   // queries: token-major, then head
     const int64_t r         = n_head_kv > 0 ? n_head_q/n_head_kv : 0;
 
     auto cache_layout = [](const ggml_tensor * t) {
@@ -9330,11 +9332,12 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
 
     const float * params = (const float *) dst->op_params;
 
-    if (q->type != GGML_TYPE_F32 || q->ne[0] != 128 || q->ne[1] != 1 || q->ne[3] != 1 || q->nb[0] != sizeof(float) ||
+    if (q->type != GGML_TYPE_F32 || q->ne[0] != 128 || n_tok < 1 || q->ne[3] != 1 || q->nb[0] != sizeof(float) ||
             !cache_layout(k) || !cache_layout(v) || v->ne[1] != n_kv || v->ne[2] != n_head_kv ||
-            r < 1 || r > 4 || r*n_head_kv != n_head_q || n_kv < min_kv ||
-            mask->type != GGML_TYPE_F16 || mask->ne[0] != n_kv || mask->ne[1] != 1 || mask->ne[3] != 1 ||
-            (mask->ne[2] != 1 && (mask->ne[2] != n_head_q || mask->nb[2] != (size_t) n_kv*sizeof(ggml_fp16_t))) ||
+            r < 1 || n_tok*r > 8 || r*n_head_kv != n_head_q || n_kv < min_kv ||
+            mask->type != GGML_TYPE_F16 || mask->ne[0] != n_kv || mask->ne[1] != n_tok || mask->ne[3] != 1 ||
+            (mask->ne[2] != 1 && mask->ne[2] != n_head_q) || mask->nb[0] != sizeof(ggml_fp16_t) ||
+            dst->nb[1] != dst->ne[0]*sizeof(float) || dst->nb[2] != dst->nb[1]*dst->ne[1] ||
             (sinks && (sinks->type != GGML_TYPE_F32 || sinks->ne[1] != 1)) ||
             dst->src[5] != nullptr || dst->src[6] != nullptr || params[1] != 0.0f || params[2] != 0.0f) {
         return false;
@@ -9346,11 +9349,15 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
     const uint32_t n_wg_s   = (uint32_t) CEIL_DIV(n_kv, keys);
     const uint32_t n_wg_v   = (uint32_t) CEIL_DIV(n_kv, 256);
     const uint32_t s_stride = n_wg_s*keys;
-    const uint32_t off_mx   = (uint32_t) n_head_q*s_stride;
-    const uint32_t off_mg   = off_mx + (uint32_t) n_head_q*n_wg_s;
-    const uint32_t off_q    = off_mg + (uint32_t) n_head_q;
-    const uint32_t off_p    = off_q + (uint32_t) n_head_q*40;
-    const uint64_t temp_sz  = ((uint64_t) off_p + (uint64_t) n_head_q*n_wg_v*129)*sizeof(float);
+    const uint32_t off_mx   = (uint32_t) n_q*s_stride;
+    const uint32_t off_mg   = off_mx + (uint32_t) n_q*n_wg_s;
+    const uint32_t off_q    = off_mg + (uint32_t) n_q;
+    const uint32_t off_p    = off_q + (uint32_t) n_q*40;
+    const uint64_t temp_sz  = ((uint64_t) off_p + (uint64_t) n_q*n_wg_v*129)*sizeof(float);
+
+    if ((uint64_t) n_q*s_stride > UINT32_MAX/2) {
+        return false;
+    }
 
     if (temp_sz > ctx->device->properties.limits.maxStorageBufferRange) {
         return false;
@@ -9377,27 +9384,30 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
     const vk_subbuffer t_buf = { ctx->prealloc_x, 0, temp_sz };
 
     // each phase reads what the one before wrote to the scratch
-    const vk_fa_q4_query_push_constants pcq = { (uint32_t) (q->nb[2]/sizeof(float)), (uint32_t) (get_misalign_bytes(ctx, q)/sizeof(float)), off_q };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pl[0], { q_buf, t_buf }, pcq, { 1, (uint32_t) n_head_q, 1 });
+    const vk_fa_q4_query_push_constants pcq = {
+        (uint32_t) (q->nb[1]/sizeof(float)), (uint32_t) (q->nb[2]/sizeof(float)), (uint32_t) (get_misalign_bytes(ctx, q)/sizeof(float)), off_q, (uint32_t) n_head_q,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pl[0], { q_buf, t_buf }, pcq, { 1, (uint32_t) n_q, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
 
     const vk_fa_q4_scores_push_constants pc0 = {
         (uint32_t) n_kv, (uint32_t) n_head_kv, (uint32_t) r, (uint32_t) mask->ne[2],
+        (uint32_t) (mask->nb[1]/sizeof(ggml_fp16_t)), (uint32_t) (mask->nb[2]/sizeof(ggml_fp16_t)), (uint32_t) n_tok, (uint32_t) n_head_q,
         (uint32_t) (get_misalign_bytes(ctx, mask)/sizeof(ggml_fp16_t)), s_stride, n_wg_s, off_mx, off_q, params[0],
     };
     ggml_vk_dispatch_pipeline(ctx, subctx, pl[1], { k_buf, m_buf, t_buf }, pc0, { (uint32_t) n_kv, (uint32_t) n_head_kv, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
 
     const vk_fa_q4_max_push_constants pc1 = { n_wg_s, off_mx, off_mg };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pl[2], { t_buf }, pc1, { 1, (uint32_t) n_head_q, 1 });
+    ggml_vk_dispatch_pipeline(ctx, subctx, pl[2], { t_buf }, pc1, { 1, (uint32_t) n_q, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
 
-    const vk_fa_q4_values_push_constants pc2 = { (uint32_t) n_kv, (uint32_t) n_head_kv, (uint32_t) r, s_stride, n_wg_v, off_mg, off_p, thr };
+    const vk_fa_q4_values_push_constants pc2 = { (uint32_t) n_kv, (uint32_t) n_head_kv, (uint32_t) r, (uint32_t) n_tok, (uint32_t) n_head_q, s_stride, n_wg_v, off_mg, off_p, thr };
     ggml_vk_dispatch_pipeline(ctx, subctx, pl[3], { v_buf, t_buf }, pc2, { (uint32_t) n_kv, (uint32_t) n_head_kv, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
 
-    const vk_fa_q4_reduce_push_constants pc3 = { n_wg_v, off_mg, off_p, (uint32_t) (get_misalign_bytes(ctx, dst)/sizeof(float)), sinks ? 1u : 0u };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pl[4], { t_buf, sinks ? ggml_vk_tensor_subbuffer(ctx, sinks, true) : t_buf, d_buf }, pc3, { 1, (uint32_t) n_head_q, 1 });
+    const vk_fa_q4_reduce_push_constants pc3 = { n_wg_v, off_mg, off_p, (uint32_t) (get_misalign_bytes(ctx, dst)/sizeof(float)), sinks ? 1u : 0u, (uint32_t) n_head_q };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pl[4], { t_buf, sinks ? ggml_vk_tensor_subbuffer(ctx, sinks, true) : t_buf, d_buf }, pc3, { 1, (uint32_t) n_q, 1 });
 
     ctx->prealloc_x_need_sync = true;
     return true;

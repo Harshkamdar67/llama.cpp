@@ -8,23 +8,29 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // Flash attention over a long Q4_0 cache: the weighted values of one block of 256 keys.
-// Workgroup (key block, KV head). The weights exp(score - max) of the block go to shared memory first; a key
-// whose weight is below thr for every query head is skipped without reading its values.
+// Workgroup (key block, KV head), for the query slots of the KV head (slot = token*r + head).
+// The weights exp(score - max) of the block go to shared memory first; a key whose weight is below thr for
+// every slot is skipped without reading its values (with two streams in one cache, that is every key of the
+// other stream).
 // Thread (g, lane): g picks one 32-bit word of codes (8 dims: 4 low nibbles, 4 high ones) of one block of 32
-// dims, lane 16 of the keys. The codes are value + 8 and a block has one scale d, so per key and head the
+// dims, lane 32 of the keys. The codes are value + 8 and a block has one scale d, so per key and slot the
 // thread adds (w*d)*code for its 8 dims and keeps sum(w*d) once for the offset.
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
-const uint MAX_R = 4;
+const uint MAX_Q = 8;
 const uint HS    = 128;
 const uint NB    = HS/32;
+const uint LANES = 8;
+const uint KEYS  = 256;
 
 layout(push_constant) uniform parameter
 {
     uint n_kv;
     uint n_head_kv;
     uint r;
+    uint n_tok;
+    uint n_head_q;
     uint s_stride;
     uint n_wg;
     uint off_mg;
@@ -40,39 +46,46 @@ struct block_q4 {
 layout(binding = 0) readonly buffer V { block_q4 data_v[]; };
 layout(binding = 1)          buffer T { float    data_t[]; };
 
-shared float w[MAX_R][256];
-shared float wmax[256];
-shared vec4  part[16][MAX_R][16][2];   // [lane][head][g][low, high]
+shared float w[MAX_Q][KEYS];
+shared float wmax[KEYS];
+shared vec4  part[LANES][MAX_Q][16][2];   // [lane][slot][g][low, high]
+
+// the query of a slot of this KV head: token*n_head_q + head
+uint query(const uint hk, const uint slot) {
+    return (slot / r)*n_head_q + hk*r + slot % r;
+}
 
 void main() {
-    const uint tid = gl_LocalInvocationID.x;
-    const uint wg  = gl_WorkGroupID.x;
-    const uint hk  = gl_WorkGroupID.y;
+    const uint tid    = gl_LocalInvocationID.x;
+    const uint wg     = gl_WorkGroupID.x;
+    const uint hk     = gl_WorkGroupID.y;
+    const uint n_slot = n_tok*r;
 
-    {
-        const uint key = wg*256 + tid;
+    [[unroll]] for (uint it = 0; it < KEYS/128; ++it) {
+        const uint kl  = tid + 128*it;
+        const uint key = wg*KEYS + kl;
         float m = 0.0;
-        [[unroll]] for (uint h = 0; h < MAX_R; ++h) {
+        [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
             float x = 0.0;
-            if (h < r && key < n_kv) {
-                const uint hq = hk*r + h;
-                x = exp(data_t[hq*s_stride + key] - data_t[off_mg + hq]);
+            if (s < n_slot && key < n_kv) {
+                const uint gq = query(hk, s);
+                x = exp(data_t[gq*s_stride + key] - data_t[off_mg + gq]);
                 x = x < thr ? 0.0 : x;
             }
-            w[h][tid] = x;
+            w[s][kl] = x;
             m = max(m, x);
         }
-        wmax[tid] = m;
+        wmax[kl] = m;
     }
     barrier();
 
-    // the sum of the weights of each head rides after its HS values
-    if (tid < r) {
+    // the sum of the weights of each query rides after its HS values
+    if (tid < n_slot) {
         float l = 0.0;
-        for (uint i = 0; i < 256; ++i) {
+        for (uint i = 0; i < KEYS; ++i) {
             l += w[tid][i];
         }
-        data_t[off_p + ((hk*r + tid)*n_wg + wg)*(HS + 1) + HS] = l;
+        data_t[off_p + (query(hk, tid)*n_wg + wg)*(HS + 1) + HS] = l;
     }
 
     const uint g    = tid % 16;
@@ -80,47 +93,49 @@ void main() {
     const uint b    = g / 4;
     const uint j    = g % 4;
 
-    vec4  lo[MAX_R];
-    vec4  hi[MAX_R];
-    float off[MAX_R];
-    [[unroll]] for (uint h = 0; h < MAX_R; ++h) {
-        lo[h]  = vec4(0.0);
-        hi[h]  = vec4(0.0);
-        off[h] = 0.0;
+    vec4  lo[MAX_Q];
+    vec4  hi[MAX_Q];
+    float off[MAX_Q];
+    [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
+        lo[s]  = vec4(0.0);
+        hi[s]  = vec4(0.0);
+        off[s] = 0.0;
     }
 
-    [[unroll]] for (uint i = 0; i < 16; ++i) {
-        const uint kl = lane*16 + i;
+    for (uint i = 0; i < KEYS/LANES; ++i) {
+        const uint kl = lane*(KEYS/LANES) + i;
         if (wmax[kl] != 0.0) {
-            const uint  ib = ((wg*256 + kl)*n_head_kv + hk)*NB + b;
+            const uint  ib = ((wg*KEYS + kl)*n_head_kv + hk)*NB + b;
             const float d  = float(data_v[ib].d);
             const uint  c  = uint(data_v[ib].qs[2*j]) | (uint(data_v[ib].qs[2*j + 1]) << 16);
             const vec4  cl = vec4(unpack8(c & 0x0F0F0F0Fu));
             const vec4  ch = vec4(unpack8((c >> 4) & 0x0F0F0F0Fu));
-            [[unroll]] for (uint h = 0; h < MAX_R; ++h) {
-                const float wd = w[h][kl]*d;
-                lo[h]  += wd*cl;
-                hi[h]  += wd*ch;
-                off[h] += wd;
+            [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
+                if (s < n_slot) {
+                    const float wd = w[s][kl]*d;
+                    lo[s]  += wd*cl;
+                    hi[s]  += wd*ch;
+                    off[s] += wd;
+                }
             }
         }
     }
-    [[unroll]] for (uint h = 0; h < MAX_R; ++h) {
-        part[lane][h][g][0] = lo[h] - 8.0*off[h];
-        part[lane][h][g][1] = hi[h] - 8.0*off[h];
+    [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
+        part[lane][s][g][0] = lo[s] - 8.0*off[s];
+        part[lane][s][g][1] = hi[s] - 8.0*off[s];
     }
     barrier();
 
-    // thread (g, head): add the 16 lanes and write the 8 dims of the word
-    if (lane < r) {
-        const uint h = lane;
+    // thread (g, slot): add the lanes and write the 8 dims of the word
+    if (lane < n_slot) {
+        const uint s = lane;
         vec4 sl = vec4(0.0);
         vec4 sh = vec4(0.0);
-        [[unroll]] for (uint i = 0; i < 16; ++i) {
-            sl += part[i][h][g][0];
-            sh += part[i][h][g][1];
+        [[unroll]] for (uint i = 0; i < LANES; ++i) {
+            sl += part[i][s][g][0];
+            sh += part[i][s][g][1];
         }
-        const uint base = off_p + ((hk*r + h)*n_wg + wg)*(HS + 1) + b*32 + 4*j;
+        const uint base = off_p + (query(hk, s)*n_wg + wg)*(HS + 1) + b*32 + 4*j;
         [[unroll]] for (uint e = 0; e < 4; ++e) {
             data_t[base + e]      = sl[e];
             data_t[base + 16 + e] = sh[e];

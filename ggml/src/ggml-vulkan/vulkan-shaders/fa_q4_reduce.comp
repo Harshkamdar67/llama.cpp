@@ -1,7 +1,7 @@
 #version 450
 
-// Flash attention over a long Q4_0 cache, phase 4 of 4: add the blocks up, the sink, and normalize.
-// Workgroup = query head, thread = value dim.
+// Flash attention over a long Q4_0 cache: add the blocks up, the sink, and normalize.
+// Workgroup = (token, query head), thread = value dim.
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -14,6 +14,7 @@ layout(push_constant) uniform parameter
     uint off_p;
     uint d_offset;
     uint has_sinks;
+    uint n_head_q;
 };
 
 layout(binding = 0) readonly  buffer T { float data_t[]; };
@@ -22,17 +23,17 @@ layout(binding = 2) writeonly buffer D { float data_d[]; };
 
 void main() {
     const uint d  = gl_LocalInvocationID.x;
-    const uint hq = gl_WorkGroupID.y;
+    const uint gq = gl_WorkGroupID.y;   // token*n_head_q + head
 
     float acc = 0.0;
     float l   = 0.0;
-    const uint base = off_p + hq*n_wg*(HS + 1);
+    const uint base = off_p + gq*n_wg*(HS + 1);
     for (uint i = 0; i < n_wg; ++i) {
         acc += data_t[base + i*(HS + 1) + d];
         l   += data_t[base + i*(HS + 1) + HS];
     }
     if (has_sinks != 0) {
-        l += exp(data_s[hq] - data_t[off_mg + hq]);
+        l += exp(data_s[gq % n_head_q] - data_t[off_mg + gq]);
     }
-    data_d[d_offset + hq*HS + d] = l > 0.0 ? acc/l : 0.0;
+    data_d[d_offset + gq*HS + d] = l > 0.0 ? acc/l : 0.0;
 }
