@@ -1806,8 +1806,39 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    // explicit layer -> device map on top of the contiguous split, as "first-last:device,..." with device an index
+    // into the device list (-dev order) and n_layer standing for the output layer, e.g. "0-5:1,18-24:1".
+    // A looped model can keep the layers it runs several times per token on the faster card this way.
+    std::vector<int> layer_dev_map(n_layer_all + 1, -1);
+    if (const char * map = getenv("LLAMA_LAYER_DEVICES")) {
+        std::string spec(map);
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t end = spec.find(',', pos);
+            if (end == std::string::npos) {
+                end = spec.size();
+            }
+            const std::string item = spec.substr(pos, end - pos);
+            int first = 0, last = 0, dev = 0;
+            if (sscanf(item.c_str(), "%d-%d:%d", &first, &last, &dev) != 3) {
+                if (sscanf(item.c_str(), "%d:%d", &first, &dev) != 2) {
+                    throw std::runtime_error("invalid LLAMA_LAYER_DEVICES entry: " + item);
+                }
+                last = first;
+            }
+            for (int il = std::max(first, 0); il <= last && il <= n_layer_all; ++il) {
+                layer_dev_map[il] = dev;
+            }
+            pos = end + 1;
+        }
+    }
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+        if (il <= n_layer_all && layer_dev_map[il] >= 0 && layer_dev_map[il] < (int) n_devices() && il >= i_gpu_start) {
+            auto * dev = devices.at(layer_dev_map[il]).dev;
+            LLAMA_LOG_INFO("load_tensors: layer %3d mapped to device %s\n", il, ggml_backend_dev_name(dev));
+            return {dev, &pimpl->gpu_buft_list.at(dev)};
+        }
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
