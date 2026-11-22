@@ -3638,7 +3638,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                          pipeline_state.HSK, pipeline_state.HSV, pipeline_state.qk_ratio, xe_fa_params.prefill_params.p_per_iter,
                                          xe_fa_params.tm, xe_fa_params.tn, xe_fa_params.prefill_params.q_in_reg, shmem_sz, xe_fa_params.prefill_params.acc_count,
                                          xe_fa_params.prefill_params.pipeline_flag, xe_fa_params.subgroup_size[0], xe_fa_params.prefill_params.gqa_fold };
-            ggml_vk_create_pipeline(device, pipelines, "xe_fa_prefill", fa_prefill_cm1_len, fa_prefill_cm1_data, "main", 6, sizeof(vk_xe_fa_push_constants), { xe_fa_params.prefill_params.gqa_fold, xe_fa_params.prefill_params.wg_row / xe_fa_params.prefill_params.gqa_fold, 1 }, sc, 1, false, true, xe_fa_params.subgroup_size[0]);
+            ggml_vk_create_pipeline(device, pipelines, "xe_fa_prefill", fa_prefill_cm1_len, fa_prefill_cm1_data, "main", 7, sizeof(vk_xe_fa_push_constants), { xe_fa_params.prefill_params.gqa_fold, xe_fa_params.prefill_params.wg_row / xe_fa_params.prefill_params.gqa_fold, 1 }, sc, 1, false, true, xe_fa_params.subgroup_size[0]);
         }
     }
 #endif
@@ -4093,6 +4093,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_conv_f32, "inkling_conv_f32", inkling_conv_f32_len, inkling_conv_f32_data, "main", 4, sizeof(vk_op_inkling_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_inkling_tag_mask_f16, "inkling_tag_mask_f16", inkling_tag_mask_f16_len, inkling_tag_mask_f16_data, "main", 3, sizeof(vk_op_inkling_tag_mask_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_proj_q8_0, "inkling_proj_q8_0", inkling_proj_q8_0_len, inkling_proj_q8_0_data, "main", 11, sizeof(vk_op_inkling_proj_push_constants), {4, 1, 1}, { 32 }, 1, false, true);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_situ_f32, "inkling_situ_f32", inkling_situ_f32_len, inkling_situ_f32_data, "main", 2, sizeof(vk_op_inkling_situ_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_mix_f32[0], "inkling_mix_a_f32", inkling_mix_f32_len, inkling_mix_f32_data, "main", 11, sizeof(vk_op_inkling_mix_push_constants), {256, 1, 1}, { 256, 0 }, 1, false, true);
@@ -8206,6 +8207,28 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
 
+void ggml_vk_inkling_tag_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * rel_pos = dst->src[0];
+    const ggml_tensor * mask    = dst->src[1];
+
+    vk_pipeline pipeline = ctx->device->pipeline_inkling_tag_mask_f16;
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_inkling_tag_mask_push_constants pc = {
+        (uint32_t) rel_pos->ne[0], (uint32_t) mask->ne[1], (uint32_t) ggml_get_op_params_i32(dst, 0),
+        ggml_vk_nb_elem(mask, 1), ggml_vk_nb_elem(mask, 3), ggml_vk_nb_elem(dst, 1), ggml_vk_nb_elem(dst, 3),
+        (uint32_t) (get_misalign_bytes(ctx, rel_pos) / sizeof(int32_t)),
+        (uint32_t) (get_misalign_bytes(ctx, mask) / sizeof(ggml_fp16_t)),
+        (uint32_t) (get_misalign_bytes(ctx, dst) / sizeof(ggml_fp16_t)),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, rel_pos, true), ggml_vk_tensor_subbuffer(ctx, mask, true), ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { (uint32_t) rel_pos->ne[0], (uint32_t) rel_pos->ne[1], 1 });
+}
+
 void ggml_vk_inkling_proj(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const int n_w = ggml_get_op_params_i32(dst, 0);
 
@@ -9261,6 +9284,8 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
 }
 
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+    // relative-position bias behind a tagged mask (ggml_flash_attn_ext_set_rel_bias): only the Xe prefill kernel reads it
+    const ggml_tensor * rel_bias = dst->src[6];
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
@@ -9827,6 +9852,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                               mask_n_head_log2, m0, m1,
                                               gqa_ratio, split_kv, split_k };
 
+    GGML_ASSERT(xe_fa_opt || (!rel_bias && !(sinks && sinks->ne[1] > 1)));
     if (xe_fa_opt) {
         uint32_t head_stride_q = uint32_t(nbq2 / ggml_type_size(q->type));
         uint32_t head_stride_k = xe_fa_dequant_kv ? uint32_t(nbk2_eff / sizeof(ggml_fp16_t)) : uint32_t(nbk2 / ggml_type_size(k->type));
@@ -9867,6 +9893,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 { q_temp_buf, k_buf, mask_buf, p_temp_buf, max_temp_buf },
                 pc_xe_fa, { (uint32_t)ph1_wg, (uint32_t)nek1, (uint32_t)neq3 });
 
+            GGML_ASSERT(!rel_bias && !(sinks && sinks->ne[1] > 1));
             ggml_vk_sync_buffers(ctx, subctx);
             ggml_pipeline_request_descriptor_sets(ctx, xe_fa_pipeline_dual_phases.second, 1);
             ggml_vk_dispatch_pipeline(ctx, subctx, xe_fa_pipeline_dual_phases.second,
@@ -9875,12 +9902,21 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
             ctx->prealloc_x_need_sync = true;
         } else {
+            if (rel_bias) {
+                // tagged mask: bias table as a seventh buffer, and sinks per token when they come that way
+                pc_xe_fa.flag |= 1u << 17;
+                pc_xe_fa.rel_dist = (uint32_t) rel_bias->ne[0];
+            }
+            if (sinks && sinks->ne[1] > 1) {
+                pc_xe_fa.flag |= 1u << 18;
+            }
             ggml_pipeline_request_descriptor_sets(ctx, xe_fa_pipeline, 1);
             ggml_vk_dispatch_pipeline(ctx, subctx, xe_fa_pipeline,
-                { q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf },
+                { q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, rel_bias ? ggml_vk_tensor_subbuffer(ctx, rel_bias) : mask_buf },
                 pc_xe_fa, { (uint32_t)neq2, (uint32_t)neq1, (uint32_t)neq3 });
         }
     } else if (split_k > 1) {
+        GGML_ASSERT(!rel_bias && !(sinks && sinks->ne[1] > 1));
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
 
         if (ctx->prealloc_split_k_need_sync) {
@@ -14105,6 +14141,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_inkling_proj(ctx, compute_ctx, node);
 
         break;
+    case GGML_OP_INKLING_TAG_MASK:
+        ggml_vk_inkling_tag_mask(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_MEAN:
         ggml_vk_mean(ctx, compute_ctx, src0, node);
 
@@ -17094,6 +17134,21 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[5] != nullptr) {
                     return false;
                 }
+                // a tagged mask with a bias table, or sinks per token: the Xe prefill kernel only (batches of more than 8 tokens)
+                if (op->src[6] != nullptr || (op->src[4] && op->src[4]->ne[1] > 1)) {
+                    if (!device->xe_fa_support || op->src[0]->ne[1] <= 8 || op->src[0]->ne[0] % 32 != 0 || op->src[2]->ne[0] % 16 != 0 ||
+                            op->src[3] == nullptr || op->src[0]->ne[2] / op->src[2]->ne[2] > 64) {
+                        return false;
+                    }
+                    // a quantized cache reaches that kernel through the dense F16 scratch: batches of 64 or more, cache layout
+                    for (int i = 1; i <= 2; ++i) {
+                        const ggml_tensor * t = op->src[i];
+                        if (t->type != GGML_TYPE_F16 &&
+                                (op->src[0]->ne[1] < 64 || t->nb[2] != ggml_row_size(t->type, t->ne[0]) || t->nb[1] != t->nb[2]*t->ne[2])) {
+                            return false;
+                        }
+                    }
+                }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
@@ -17391,6 +17446,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->nb[0] == sizeof(float);
         case GGML_OP_INKLING_CONV:
             return op->src[1]->ne[1] <= 65535*256 && op->src[0]->ne[1] <= 65535;
+        case GGML_OP_INKLING_TAG_MASK:
+            return op->src[0]->ne[1] <= 65535;
         case GGML_OP_INKLING_PROJ:
             // Q8_0 matrices only, four rows per workgroup, whole blocks per thread
             if (!device->subgroup_arithmetic || !device->subgroup_require_full_support || op->src[0]->ne[0] % 32 != 0) {

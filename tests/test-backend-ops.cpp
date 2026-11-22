@@ -4778,6 +4778,83 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with a tagged mask (GGML_OP_INKLING_TAG_MASK) and a relative-position bias table
+struct test_flash_attn_rel : public test_case {
+    const int64_t n_kv;
+    const int64_t n_tokens;
+    const int64_t n_extent;
+    const ggml_type type_KV;
+    const bool sinks_per_token;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_REL";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_kv, n_tokens, n_extent, type_KV, sinks_per_token);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_rel(int64_t n_kv = 2560, int64_t n_tokens = 64, int64_t n_extent = 1024, ggml_type type_KV = GGML_TYPE_F16, bool sinks_per_token = true)
+        : n_kv(n_kv), n_tokens(n_tokens), n_extent(n_extent), type_KV(type_KV), sinks_per_token(sinks_per_token) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(11);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                // distances, about half of them past the extent
+                std::vector<int32_t> v(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> dist(0, (int32_t) (2*n_extent));
+                for (auto & x : v) {
+                    x = dist(rng);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                // a quarter of the keys hidden
+                std::vector<ggml_fp16_t> v(ggml_nelements(t));
+                std::uniform_int_distribution<int> hide(0, 3);
+                for (auto & x : v) {
+                    x = ggml_fp32_to_fp16(hide(rng) == 0 ? -INFINITY : 0.0f);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hs = 128, n_head = 24, n_head_kv = 8;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, n_tokens, n_head, 1);
+        // the cache layout: [head_dim, n_head_kv, n_kv] storage, read through a permuted view
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, n_head_kv, n_kv, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, n_head_kv, n_kv, 1);
+        ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_tokens);
+        ggml_tensor * mask    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tokens, 1, 1);
+        ggml_tensor * table   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_extent + 1, n_head, n_tokens);
+        ggml_tensor * sinks   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, sinks_per_token ? n_tokens : 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(rel_pos, "rel_pos");
+        ggml_set_name(mask, "mask");
+        ggml_set_name(table, "table");
+        ggml_set_name(sinks, "sinks");
+
+        ggml_tensor * tag = ggml_inkling_tag_mask(ctx, rel_pos, mask, table, (int) n_extent);
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, ggml_permute(ctx, k, 0, 2, 1, 3), ggml_permute(ctx, v, 0, 2, 1, 3), tag, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_rel_bias(out, table);
+        ggml_flash_attn_ext_add_sinks(out, sinks);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_INKLING_PROJ
 struct test_inkling_proj : public test_case {
     const int64_t n_embd;
@@ -11067,6 +11144,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    test_cases.emplace_back(new test_flash_attn_rel(2560, 64, 1024, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_flash_attn_rel(2560, 256, 1024, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_flash_attn_rel(5000, 128, 1024, GGML_TYPE_F16, false));
+    test_cases.emplace_back(new test_flash_attn_rel(2560, 128, 1024, GGML_TYPE_Q4_0, true));
+    test_cases.emplace_back(new test_flash_attn_rel(4096, 256, 1024, GGML_TYPE_Q8_0, true));
     test_cases.emplace_back(new test_inkling_proj(64, 1, {8, 4, 12}, {0, 1, 2}));
     test_cases.emplace_back(new test_inkling_proj(64, 3, {8, 4, 12, 4, 8, 4, 4}, {0, 0, 1, 2, 2, 1, 0}));
     test_cases.emplace_back(new test_inkling_proj(2304, 1, {3072, 3072, 384, 24, 1024, 1024}, {0, 0, 0, 0, 1, 2}));

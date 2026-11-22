@@ -178,6 +178,7 @@ struct vk_xe_fa_push_constants {
     uint32_t nb3;
     uint32_t flag;
     float scale;
+    uint32_t rel_dist;
 };
 
 struct vk_op_push_constants {
@@ -230,6 +231,19 @@ struct vk_op_dsv4_hc_pre_push_constants {
     uint32_t d_offset;
 
     float scale;
+};
+
+struct vk_op_inkling_tag_mask_push_constants {
+    uint32_t n_kv;
+    uint32_t n_tps;
+    uint32_t n_extent;
+    uint32_t nbm1;
+    uint32_t nbm3;
+    uint32_t nbd1;
+    uint32_t nbd3;
+    uint32_t p_offset;
+    uint32_t m_offset;
+    uint32_t d_offset;
 };
 
 struct vk_op_inkling_proj_push_constants {

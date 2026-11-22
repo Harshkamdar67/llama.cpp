@@ -8869,6 +8869,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
+    const ggml_tensor * rel_bias = dst->src[6];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8978,9 +8979,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
+            }
+            if (rel_bias && mv > 0.5f) {
+                // 1 + distance: the bias of this head and token at that distance
+                mv = ((const float *) ((const char *) rel_bias->data + iq2*rel_bias->nb[1] + (iq1 + iq3*q->ne[1])*rel_bias->nb[2]))[(int64_t) mv - 1];
             }
 
             const int64_t ik1 = rows ? rows[ic] : ic;
@@ -9036,7 +9041,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         // sinks - apply only on the first kv-chunk
         if (sinks && ic_start == 0) {
-            const float s = ((float *)((char *) sinks->data))[h];
+            const float s = ((float *)((char *) sinks->data))[h + (sinks->ne[1] > 1 ? sinks->ne[0]*(iq1 + iq3*q->ne[1]) : 0)];
 
             float ms = 1.0f;
             float vs = 1.0f;
@@ -9084,6 +9089,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * rel_bias = dst->src[6];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9239,6 +9245,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                             can_skip = false;
                         }
+                        if (rel_bias && mask32[tq * KV_TILE_SZ + tk] > 0.5f) {
+                            mask32[tq * KV_TILE_SZ + tk] = ((const float *) ((const char *) rel_bias->data + iq2*rel_bias->nb[1] +
+                                    (iq1 + tq + iq3*q->ne[1])*rel_bias->nb[2]))[(int64_t) mask32[tq * KV_TILE_SZ + tk] - 1];
+                        }
                     }
                     // Pad remaining mask entries with -inf
                     for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
@@ -9336,9 +9346,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
         // sinks (apply only to valid rows in the tile)
         if (sinks) {
-            const float s = ((float *)((char *) sinks->data))[h];
-
             for (int tq = 0; tq < tile_rows; tq++) {
+                const float s = ((float *)((char *) sinks->data))[h + (sinks->ne[1] > 1 ? sinks->ne[0]*(iq1 + tq + iq3*q->ne[1]) : 0)];
                 float ms = 1.0f;
                 float vs = 1.0f;
 
@@ -11559,6 +11568,34 @@ void ggml_compute_forward_dsv4_hc_pre(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_inkling_tag_mask
+
+void ggml_compute_forward_inkling_tag_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * rel_pos = dst->src[0];
+    const ggml_tensor * mask    = dst->src[1];
+
+    const int32_t n_extent = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_kv     = rel_pos->ne[0];
+    const int64_t n_tokens = rel_pos->ne[1];
+    const int64_t n_tps    = mask->ne[1];
+
+    for (int64_t tt = params->ith; tt < n_tokens; tt += params->nth) {
+        const int64_t s = tt / n_tps;
+        const int64_t t = tt % n_tps;
+
+        const int32_t     * p = (const int32_t *) rel_pos->data + n_kv*tt;
+        const ggml_fp16_t * m = (const ggml_fp16_t *) ((const char *) mask->data + t*mask->nb[1] + s*mask->nb[3]);
+        ggml_fp16_t       * d = (ggml_fp16_t *) ((char *) dst->data + t*dst->nb[1] + s*dst->nb[3]);
+
+        for (int64_t kv = 0; kv < n_kv; ++kv) {
+            const bool near = GGML_CPU_FP16_TO_FP32(m[kv]) == 0.0f && p[kv] >= 0 && p[kv] < n_extent;
+            d[kv] = near ? GGML_CPU_FP32_TO_FP16((float) (p[kv] + 1)) : m[kv];
+        }
     }
 }
 

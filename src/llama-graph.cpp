@@ -3245,6 +3245,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
+        if (kq_mask && kq_mask->op == GGML_OP_INKLING_TAG_MASK && kq_mask->src[2]) {
+            // the mask tags the keys near each query; their bias per head comes from the table the tag op carries
+            ggml_flash_attn_ext_set_rel_bias(cur, kq_mask->src[2]);
+        }
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
@@ -4522,7 +4526,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_b->op == GGML_OP_INKLING_REL_MASK) {
+    if (kq_b->op == GGML_OP_INKLING_REL_MASK || kq_b->op == GGML_OP_INKLING_TAG_MASK) {
         // the model built the whole mask, bias and input mask together, in the type flash attention takes
         kq_mask = kq_b;
     } else {

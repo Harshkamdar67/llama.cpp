@@ -421,6 +421,7 @@ extern "C" {
         GGML_OP_INKLING_SITU,
         GGML_OP_INKLING_CONV,
         GGML_OP_INKLING_PROJ,
+        GGML_OP_INKLING_TAG_MASK,
 
         GGML_OP_UNARY,
 
@@ -2285,6 +2286,13 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // relative-position bias without a mask per head: a mask value above 0.5 stands for 1 + distance, and the key's
+    // logit takes bias[distance, head, token] in place of the mask value. bias: F32 [n_dist, n_head, n_tokens],
+    // tokens in the order of q's dims 1 then 3. With it, sinks may also be per token: [n_head, n_tokens].
+    GGML_API void ggml_flash_attn_ext_set_rel_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * bias);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
@@ -2520,6 +2528,17 @@ extern "C" {
             struct ggml_tensor  * past,
             struct ggml_tensor  * weight,
             float                 scale);
+
+    // Inkling 2: the attention mask shared by all heads with the keys within the relative-position extent tagged.
+    // rel_pos: I32 [n_kv, n_tokens] distances (n_extent or more when out of range), mask: F16 [n_kv, n_tokens/n_stream, 1, n_stream].
+    // Result, in the layout of mask: 1 + distance for a visible key at a distance below n_extent, else the mask value.
+    // bias_table (may be NULL) is not read; it rides along as a source for ggml_flash_attn_ext_set_rel_bias.
+    GGML_API struct ggml_tensor * ggml_inkling_tag_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * rel_pos,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * bias_table,
+            int                   n_extent);
 
     // Inkling 2: several matrices times a few input vectors as one op, for the projections of a layer visit that
     // read the same inputs. inputs: n_inputs <= 3 tensors [n_embd, n_tokens] with contiguous rows; weights:

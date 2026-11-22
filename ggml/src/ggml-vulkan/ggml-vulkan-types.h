@@ -1003,6 +1003,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_inkling_situ_f32;
     vk_pipeline pipeline_inkling_conv_f32;
     vk_pipeline pipeline_inkling_proj_q8_0;
+    vk_pipeline pipeline_inkling_tag_mask_f16;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;

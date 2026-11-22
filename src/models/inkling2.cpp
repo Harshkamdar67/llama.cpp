@@ -460,7 +460,18 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * mask_raw = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
         static const bool no_fuse_mask = (getenv("LLAMA_INKLING_NO_FUSE") != nullptr || getenv("LLAMA_INKLING_NO_MASK") != nullptr);
         ggml_tensor * kq_b = nullptr;
-        if (!no_fuse_mask && cparams.flash_attn && mask_raw->type == GGML_TYPE_F16 && layer.attn_rel_bias->type == GGML_TYPE_F32) {
+        // long caches, batches: one mask for all heads with the keys within the extent tagged, the bias of each head
+        // read from a table inside flash attention and the sink passed per token. No mask per head (n_kv x n_tokens x
+        // n_head) is built or read. Needs a backend whose flash attention takes ggml_flash_attn_ext_set_rel_bias
+        // (Vulkan on Xe, the CPU), so it is opt-in: LLAMA_INKLING_REL_TAG=1.
+        static const bool rel_tag = getenv("LLAMA_INKLING_REL_TAG") != nullptr && getenv("LLAMA_INKLING_NO_FUSE") == nullptr;
+        const bool use_tag = rel_tag && !is_swa && n_tokens >= 32 && cparams.flash_attn && mask_raw->type == GGML_TYPE_F16 &&
+                             layer.attn_rel_bias->type == GGML_TYPE_F32 && layer.attn_rel_bias->ne[1] <= 2047;
+        if (use_tag) {
+            // [n_extent + 1, n_head, n_tokens]
+            ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+            kq_b = ggml_inkling_tag_mask(ctx0, rel_pos, mask_raw, table, (int) layer.attn_rel_bias->ne[1]);
+        } else if (!no_fuse_mask && cparams.flash_attn && mask_raw->type == GGML_TYPE_F16 && layer.attn_rel_bias->type == GGML_TYPE_F32) {
             // the whole per-head mask in one op, written once in F16: bias row by distance, minus the sink, plus the mask
             kq_b = ggml_inkling_rel_mask(ctx0, Rcur, layer.attn_rel_bias, sinks, rel_pos, mask_raw, GGML_TYPE_F16);
         }
@@ -491,7 +502,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, kq_b, sinks_zero, t*t/sqrtf(n_embd_head), il);
+                Qcur, Kcur, Vcur, kq_b, use_tag ? sinks : sinks_zero, t*t/sqrtf(n_embd_head), il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, project(5, layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);

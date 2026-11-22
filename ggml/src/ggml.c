@@ -1105,6 +1105,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "INKLING_SITU",
     "INKLING_CONV",
     "INKLING_PROJ",
+    "INKLING_TAG_MASK",
 
     "UNARY",
 
@@ -1124,7 +1125,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1226,6 +1227,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "inkling_situ(x)",
     "inkling_conv(cur, past, weight)",
     "inkling_proj(inputs, weights)",
+    "inkling_tag_mask(rel_pos, mask)",
 
     "unary(x)",
 
@@ -1245,7 +1247,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5534,8 +5536,21 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(a->src[4] == NULL);
     GGML_ASSERT(a->src[0]->ne[2] == sinks->ne[0]);
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
+    // one row per head, or one per head and token
+    GGML_ASSERT(sinks->ne[1] == 1 || (sinks->ne[1] == a->src[0]->ne[1]*a->src[0]->ne[3] && sinks->nb[1] == sinks->ne[0]*sizeof(float)));
 
     a->src[4] = sinks;
+}
+
+void ggml_flash_attn_ext_set_rel_bias(
+        struct ggml_tensor * a,
+        struct ggml_tensor * bias) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[3] != NULL && a->src[5] == NULL && a->src[6] == NULL);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias));
+    GGML_ASSERT(bias->ne[1] == a->src[0]->ne[2] && bias->ne[2] == a->src[0]->ne[1]*a->src[0]->ne[3]);
+
+    a->src[6] = bias;
 }
 
 // ggml_flash_attn_back
@@ -6566,6 +6581,35 @@ struct ggml_tensor * ggml_inkling_conv(
     result->src[0] = cur;
     result->src[1] = past;
     result->src[2] = weight;
+
+    return result;
+}
+
+// ggml_inkling_tag_mask
+
+struct ggml_tensor * ggml_inkling_tag_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * rel_pos,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * bias_table,
+        int                   n_extent) {
+    const int64_t n_kv     = rel_pos->ne[0];
+    const int64_t n_tokens = rel_pos->ne[1];
+
+    GGML_ASSERT(rel_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(rel_pos));
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && mask->ne[0] == n_kv && mask->ne[2] == 1 && mask->ne[1]*mask->ne[3] == n_tokens);
+    GGML_ASSERT(mask->nb[0] == sizeof(ggml_fp16_t));
+    // 1 + distance must stay exact in F16
+    GGML_ASSERT(n_extent > 0 && n_extent <= 2047);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, mask->ne[1], 1, mask->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, n_extent);
+
+    result->op     = GGML_OP_INKLING_TAG_MASK;
+    result->src[0] = rel_pos;
+    result->src[1] = mask;
+    result->src[2] = bias_table;
 
     return result;
 }
