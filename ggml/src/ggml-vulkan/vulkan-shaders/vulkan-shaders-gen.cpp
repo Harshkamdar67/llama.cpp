@@ -1096,6 +1096,8 @@ void process_shaders() {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     string_to_spv("fa_q4_query", "fa_q4_query.comp", {});
     string_to_spv("fa_q4_scores", "fa_q4_scores.comp", {});
+    string_to_spv("fa_q4_scores_8", "fa_q4_scores.comp", {{"FA_Q4_SLOTS", "8"}});
+    string_to_spv("fa_q4_values_8", "fa_q4_values.comp", {{"FA_Q4_SLOTS", "8"}});
     string_to_spv("fa_q4_max", "fa_q4_max.comp", {});
     string_to_spv("fa_q4_values", "fa_q4_values.comp", {});
     string_to_spv("fa_q4_reduce", "fa_q4_reduce.comp", {});

@@ -4097,7 +4097,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->integer_dot_product && device->subgroup_arithmetic && device->subgroup_require_full_support) {
         const uint32_t fa_q4_keys = 1024; // keys per scores workgroup
         ggml_vk_create_pipeline(device, device->pipeline_fa_q4[0], "fa_q4_query", fa_q4_query_len, fa_q4_query_data, "main", 2, sizeof(vk_fa_q4_query_push_constants), {1, 1, 1}, {}, 1);
+        // slot counts 4 (one token) and 8 (two tokens) as separate pipelines: sized for 8, a one-token step leaves 5 of 8 threads idle
         ggml_vk_create_pipeline(device, device->pipeline_fa_q4[1], "fa_q4_scores", fa_q4_scores_len, fa_q4_scores_data, "main", 3, sizeof(vk_fa_q4_scores_push_constants), {fa_q4_keys, 1, 1}, {fa_q4_keys}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_fa_q4_wide[0], "fa_q4_scores_8", fa_q4_scores_8_len, fa_q4_scores_8_data, "main", 3, sizeof(vk_fa_q4_scores_push_constants), {fa_q4_keys, 1, 1}, {fa_q4_keys}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_fa_q4_wide[1], "fa_q4_values_8", fa_q4_values_8_len, fa_q4_values_8_data, "main", 2, sizeof(vk_fa_q4_values_push_constants), {256, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_fa_q4[2], "fa_q4_max", fa_q4_max_len, fa_q4_max_data, "main", 1, sizeof(vk_fa_q4_max_push_constants), {1, 1, 1}, {}, 1, false, true);
         ggml_vk_create_pipeline(device, device->pipeline_fa_q4[3], "fa_q4_values", fa_q4_values_len, fa_q4_values_data, "main", 2, sizeof(vk_fa_q4_values_push_constants), {256, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_fa_q4[4], "fa_q4_reduce", fa_q4_reduce_len, fa_q4_reduce_data, "main", 3, sizeof(vk_fa_q4_reduce_push_constants), {1, 1, 1}, {}, 1);
@@ -9344,10 +9347,10 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
     }
 
     // scratch, in floats: the scores of each query head, the maximum of each scores workgroup, the maximum of each
-    // head, the quantized queries (40 values a head), then per head and values workgroup 128 sums and their weight
+    // head, the quantized queries (40 values a head), then per query and half of a values workgroup 128 sums and their weight
     const uint32_t keys     = ctx->device->pipeline_fa_q4[1]->wg_denoms[0];
     const uint32_t n_wg_s   = (uint32_t) CEIL_DIV(n_kv, keys);
-    const uint32_t n_wg_v   = (uint32_t) CEIL_DIV(n_kv, 256);
+    const uint32_t n_wg_v   = 2*(uint32_t) CEIL_DIV(n_kv, 256);   // rows of partial sums: two halves per values workgroup
     const uint32_t s_stride = n_wg_s*keys;
     const uint32_t off_mx   = (uint32_t) n_q*s_stride;
     const uint32_t off_mg   = off_mx + (uint32_t) n_q*n_wg_s;
@@ -9363,7 +9366,15 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
         return false;
     }
 
-    vk_pipeline * pl = ctx->device->pipeline_fa_q4;
+    const bool wide = n_tok*r > 4;
+    vk_pipeline pl[5];
+    for (int i = 0; i < 5; ++i) {
+        pl[i] = ctx->device->pipeline_fa_q4[i];
+    }
+    if (wide) {
+        pl[1] = ctx->device->pipeline_fa_q4_wide[0];
+        pl[3] = ctx->device->pipeline_fa_q4_wide[1];
+    }
     for (int i = 0; i < 5; ++i) {
         ggml_pipeline_request_descriptor_sets(ctx, pl[i], 1);
     }

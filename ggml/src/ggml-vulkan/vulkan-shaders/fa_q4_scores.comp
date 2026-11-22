@@ -15,13 +15,16 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-const uint MAX_Q = 8;      // query slots of a KV head: tokens x query heads per KV head
 const uint HS    = 128;
 const uint NB    = HS/32;
-const uint LANES = 256/MAX_Q;
 const float NEG  = -3.0e38;
 
-layout(constant_id = 0) const uint KEYS = 1024;   // keys per workgroup, a multiple of LANES
+layout(constant_id = 0) const uint KEYS  = 1024;  // keys per workgroup, a multiple of LANES
+// query slots of a KV head (tokens x query heads per KV head): 4, or 8 in the two-token variant
+#ifndef FA_Q4_SLOTS
+#define FA_Q4_SLOTS 4
+#endif
+const uint MAX_Q = FA_Q4_SLOTS;
 
 layout(push_constant) uniform parameter
 {
@@ -50,6 +53,8 @@ layout(binding = 0) readonly buffer K  { block_q4  data_k[]; };
 layout(binding = 1) readonly buffer M  { float16_t data_m[]; };
 layout(binding = 2)          buffer T  { float     data_t[]; };
 layout(binding = 2)          buffer TI { int32_t   data_ti[]; };
+
+const uint LANES = 256/MAX_Q;
 
 shared float red[256];
 

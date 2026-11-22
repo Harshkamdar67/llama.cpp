@@ -1006,6 +1006,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_inkling_tag_mask_f16;
     // one query token over a long Q4_0 cache: query, scores, max, weighted values, reduce (fa_q4_*.comp)
     vk_pipeline pipeline_fa_q4[5];
+    vk_pipeline pipeline_fa_q4_wide[2];   // scores and values for 8 query slots (two tokens a step)
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;

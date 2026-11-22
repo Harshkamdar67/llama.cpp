@@ -7,22 +7,26 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
-// Flash attention over a long Q4_0 cache: the weighted values of one block of 256 keys.
-// Workgroup (key block, KV head), for the query slots of the KV head (slot = token*r + head).
-// The weights exp(score - max) of the block go to shared memory first; a key whose weight is below thr for
-// every slot is skipped without reading its values (with two streams in one cache, that is every key of the
-// other stream).
-// Thread (g, lane): g picks one 32-bit word of codes (8 dims: 4 low nibbles, 4 high ones) of one block of 32
-// dims, lane 32 of the keys. The codes are value + 8 and a block has one scale d, so per key and slot the
-// thread adds (w*d)*code for its 8 dims and keeps sum(w*d) once for the offset.
+// Flash attention over a long Q4_0 cache: the weighted values.
+// Workgroup (256 keys, KV head), for the query slots of the KV head (slot = token*r + head), in two halves of
+// 128 keys that each write one row of partial sums. The weights exp(score - max) of the keys go to shared
+// memory first; a key whose weight is below thr for every slot is skipped without reading its values (with two
+// streams in one cache, that is every key of the other stream).
+// Thread (half, g): g picks one 32-bit word of codes (8 dims: 4 low nibbles, 4 high ones) of one block of 32
+// dims and walks the 128 keys of its half, so no sum crosses threads. The codes are value + 8 and a block has
+// one scale d: per key and slot the thread adds (w*d)*code for its 8 dims and keeps sum(w*d) for the offset.
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#ifndef FA_Q4_SLOTS
+#define FA_Q4_SLOTS 4
+#endif
+const uint MAX_Q = FA_Q4_SLOTS;
 
-const uint MAX_Q = 8;
-const uint HS    = 128;
-const uint NB    = HS/32;
-const uint LANES = 8;
-const uint KEYS  = 256;
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+const uint HS   = 128;
+const uint NB   = HS/32;
+const uint KEYS = 256;
+const uint HALF = KEYS/2;
 
 layout(push_constant) uniform parameter
 {
@@ -32,7 +36,7 @@ layout(push_constant) uniform parameter
     uint n_tok;
     uint n_head_q;
     uint s_stride;
-    uint n_wg;
+    uint n_part;     // rows of partial sums per query: two per workgroup
     uint off_mg;
     uint off_p;
     float thr;
@@ -48,12 +52,6 @@ layout(binding = 1)          buffer T { float    data_t[]; };
 
 shared float w[MAX_Q][KEYS];
 shared float wmax[KEYS];
-shared vec4  part[LANES][MAX_Q][16][2];   // [lane][slot][g][low, high]
-
-// the query of a slot of this KV head: token*n_head_q + head
-uint query(const uint hk, const uint slot) {
-    return (slot / r)*n_head_q + hk*r + slot % r;
-}
 
 void main() {
     const uint tid    = gl_LocalInvocationID.x;
@@ -61,15 +59,19 @@ void main() {
     const uint hk     = gl_WorkGroupID.y;
     const uint n_slot = n_tok*r;
 
-    [[unroll]] for (uint it = 0; it < KEYS/128; ++it) {
-        const uint kl  = tid + 128*it;
+    // the queries of the slots (token*n_head_q + head), once: the divisions are not for the loops below
+    uint gqs[MAX_Q];
+    [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
+        gqs[s] = (s / r)*n_head_q + hk*r + s % r;
+    }
+
+    for (uint kl = tid; kl < KEYS; kl += 32) {
         const uint key = wg*KEYS + kl;
         float m = 0.0;
         [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
             float x = 0.0;
             if (s < n_slot && key < n_kv) {
-                const uint gq = query(hk, s);
-                x = exp(data_t[gq*s_stride + key] - data_t[off_mg + gq]);
+                x = exp(data_t[gqs[s]*s_stride + key] - data_t[off_mg + gqs[s]]);
                 x = x < thr ? 0.0 : x;
             }
             w[s][kl] = x;
@@ -79,31 +81,24 @@ void main() {
     }
     barrier();
 
-    // the sum of the weights of each query rides after its HS values
-    if (tid < n_slot) {
-        float l = 0.0;
-        for (uint i = 0; i < KEYS; ++i) {
-            l += w[tid][i];
-        }
-        data_t[off_p + (query(hk, tid)*n_wg + wg)*(HS + 1) + HS] = l;
-    }
-
+    const uint hf   = tid / 16;
     const uint g    = tid % 16;
-    const uint lane = tid / 16;
     const uint b    = g / 4;
     const uint j    = g % 4;
 
     vec4  lo[MAX_Q];
     vec4  hi[MAX_Q];
     float off[MAX_Q];
+    float l[MAX_Q];
     [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
         lo[s]  = vec4(0.0);
         hi[s]  = vec4(0.0);
         off[s] = 0.0;
+        l[s]   = 0.0;
     }
 
-    for (uint i = 0; i < KEYS/LANES; ++i) {
-        const uint kl = lane*(KEYS/LANES) + i;
+    for (uint i = 0; i < HALF; ++i) {
+        const uint kl = hf*HALF + i;
         if (wmax[kl] != 0.0) {
             const uint  ib = ((wg*KEYS + kl)*n_head_kv + hk)*NB + b;
             const float d  = float(data_v[ib].d);
@@ -111,34 +106,29 @@ void main() {
             const vec4  cl = vec4(unpack8(c & 0x0F0F0F0Fu));
             const vec4  ch = vec4(unpack8((c >> 4) & 0x0F0F0F0Fu));
             [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
-                if (s < n_slot) {
-                    const float wd = w[s][kl]*d;
-                    lo[s]  += wd*cl;
-                    hi[s]  += wd*ch;
-                    off[s] += wd;
-                }
+                const float ws = w[s][kl];
+                const float wd = ws*d;
+                lo[s]  += wd*cl;
+                hi[s]  += wd*ch;
+                off[s] += wd;
+                l[s]   += ws;
             }
         }
     }
-    [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
-        part[lane][s][g][0] = lo[s] - 8.0*off[s];
-        part[lane][s][g][1] = hi[s] - 8.0*off[s];
-    }
-    barrier();
 
-    // thread (g, slot): add the lanes and write the 8 dims of the word
-    if (lane < n_slot) {
-        const uint s = lane;
-        vec4 sl = vec4(0.0);
-        vec4 sh = vec4(0.0);
-        [[unroll]] for (uint i = 0; i < LANES; ++i) {
-            sl += part[i][s][g][0];
-            sh += part[i][s][g][1];
-        }
-        const uint base = off_p + (query(hk, s)*n_wg + wg)*(HS + 1) + b*32 + 4*j;
-        [[unroll]] for (uint e = 0; e < 4; ++e) {
-            data_t[base + e]      = sl[e];
-            data_t[base + 16 + e] = sh[e];
+    [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
+        if (s < n_slot) {
+            const uint p = off_p + (gqs[s]*n_part + wg*2 + hf)*(HS + 1);
+            const vec4 sl = lo[s] - 8.0*off[s];
+            const vec4 sh = hi[s] - 8.0*off[s];
+            [[unroll]] for (uint e = 0; e < 4; ++e) {
+                data_t[p + b*32 + 4*j + e]      = sl[e];
+                data_t[p + b*32 + 4*j + 16 + e] = sh[e];
+            }
+            // the sum of the weights of the half rides after its HS values
+            if (g == 0) {
+                data_t[p + HS] = l[s];
+            }
         }
     }
 }
