@@ -313,6 +313,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Rwkv7ForCausalLM": "rwkv",
     "RwkvHybridForCausalLM": "rwkv",
     "Sarashina2VisionForCausalLM": "sarashina2",
+    "SarvamMLAForCausalLM": "deepseek",
     "SarvamMoEForCausalLM": "bailingmoe",
     "SeedOssForCausalLM": "olmo",
     "SmallThinkerForCausalLM": "smallthinker",
@@ -347,6 +348,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "ZayaForCausalLM": "zaya1",
     "fish_qwen3_omni": "fish_s2",
     "modeling_grove_moe.GroveMoeForCausalLM": "grovemoe",
+    "modeling_sarvam_moe.SarvamMLAForCausalLM": "deepseek",
     "modeling_sarvam_moe.SarvamMoEForCausalLM": "bailingmoe",
 }
 

@@ -10,7 +10,8 @@ void llama_model_deepseek2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
     if (!is_lite) {
-        ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK, hparams.n_lora_q);
+        // absent when the queries are a plain projection (Sarvam 105B)
+        ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK, hparams.n_lora_q, false);
     }
     ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,     hparams.n_lora_kv);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   hparams.n_embd_head_k_mla_impl, false);

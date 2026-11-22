@@ -468,6 +468,40 @@ class DeepseekV2Model(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("SarvamMLAForCausalLM", "modeling_sarvam_moe.SarvamMLAForCausalLM")
+@ModelBase.example("sarvamai/sarvam-105b")
+class SarvamMLAModel(DeepseekV2Model):
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK2
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        hparams = self.hparams
+        hparams["n_routed_experts"] = hparams["num_experts"]
+        hparams["n_shared_experts"] = hparams["num_shared_experts"]
+        # the split of kv_b_proj needs the head count; MLA is written as MQA with one KV head later
+        hparams.setdefault("num_key_value_heads", hparams["num_attention_heads"])
+        # the router is fixed in the modeling code (MoEGate), not in the config: sigmoid scores with a selection
+        # bias, the top 2 of num_experts // 8 groups, weights normalized over the selected experts
+        hparams.setdefault("scoring_func", "sigmoid")
+        hparams.setdefault("norm_topk_prob", True)
+        hparams.setdefault("n_group", hparams["num_experts"] // 8)
+        hparams.setdefault("topk_group", 2)
+        if self.rope_parameters.get("rope_type", self.rope_parameters.get("type")) == "deepseek_yarn":
+            self.rope_parameters["rope_type"] = "yarn"
+
+    def set_vocab(self):
+        # BPE with byte fallback: mark <0xXX> tokens as BYTE so they decode to raw bytes
+        tokens, toktypes, tokpre = self.get_vocab_base()
+        toktypes = [gguf.TokenType.BYTE if re.fullmatch(r"<0x[0-9A-F]{2}>", tok) else typ for tok, typ in zip(tokens, toktypes)]
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre(tokpre)
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+
 @ModelBase.register("DeepseekV32ForCausalLM")
 @ModelBase.example("deepseek-ai/DeepSeek-V3.2-Exp")
 class DeepseekV32Model(DeepseekV2Model):
