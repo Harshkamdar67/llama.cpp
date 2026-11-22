@@ -10,7 +10,7 @@
 // Flash attention for one query token over a long Q4_0 cache: the scores.
 // The cache codes are integers, so a key's dot product with a query quantized to 8 bits (fa_q4_query.comp)
 // is four multiply-adds per instruction; the 4-bit keys carry 16 times the rounding error the query adds.
-// Workgroup (block of KEYS keys, KV head): thread (key lane, query slot) keeps its query's 32 words
+// Workgroup (block of KEYS keys, KV head, token): thread (key lane, query slot) keeps its query's 32 words
 // and walks its keys, so nothing goes through shared memory until the block maximum at the end.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -20,11 +20,8 @@ const uint NB    = HS/32;
 const float NEG  = -3.0e38;
 
 layout(constant_id = 0) const uint KEYS  = 1024;  // keys per workgroup, a multiple of LANES
-// query slots of a KV head (tokens x query heads per KV head): 4, or 8 in the two-token variant
-#ifndef FA_Q4_SLOTS
-#define FA_Q4_SLOTS 4
-#endif
-const uint MAX_Q = FA_Q4_SLOTS;
+// query slots: the r <= 4 query heads of the KV head, for the token of the workgroup
+const uint MAX_Q = 4;
 
 layout(push_constant) uniform parameter
 {
@@ -42,6 +39,8 @@ layout(push_constant) uniform parameter
     uint off_mx;
     uint off_q;      // per query head: 32 words, 4 block sums, the scale and 3 unused (40 values)
     float scale;
+    uint rel_dist;   // rows of the bias table per query, 0: the mask holds the bias already
+    uint rb_offset;
 };
 
 struct block_q4 {
@@ -53,6 +52,8 @@ layout(binding = 0) readonly buffer K  { block_q4  data_k[]; };
 layout(binding = 1) readonly buffer M  { float16_t data_m[]; };
 layout(binding = 2)          buffer T  { float     data_t[]; };
 layout(binding = 2)          buffer TI { int32_t   data_ti[]; };
+// relative-position bias [rel_dist, n_head_q, n_tok], read where the mask holds 1 + distance
+layout(binding = 3) readonly buffer RB { float     data_rb[]; };
 
 const uint LANES = 256/MAX_Q;
 
@@ -62,15 +63,16 @@ void main() {
     const uint tid  = gl_LocalInvocationID.x;
     const uint wg   = gl_WorkGroupID.x;
     const uint hk   = gl_WorkGroupID.y;
-    const uint slot = tid % MAX_Q;
-    const uint lane = tid / MAX_Q;
-    const uint t    = slot / r;
-    const uint hq   = hk*r + slot % r;
+    // the threads of a slot are neighbours, so a block of keys its token cannot see is skipped by whole SIMD groups
+    const uint slot = tid / LANES;
+    const uint lane = tid % LANES;
+    const uint t    = gl_WorkGroupID.z;   // a workgroup serves one token, so it skips whole blocks the token cannot see
+    const uint hq   = hk*r + slot;
     const uint gq   = t*n_head_q + hq;
 
     float mx = NEG;
 
-    if (slot < n_tok*r) {
+    if (slot < r) {
         // words 8b..8b+3 pair with the low nibbles of block b (its dims 0..15), 8b+4..8b+7 with the high ones
         const uint qb = off_q + gq*40;
         int32_t qw[32];
@@ -90,6 +92,12 @@ void main() {
                 data_t[gq*s_stride + key] = NEG;
                 continue;
             }
+            // a hidden key (another stream's, an empty cell): no read of its K
+            float m = float(data_m[mrow + key]);
+            if (m < -1.0e30) {
+                data_t[gq*s_stride + key] = NEG;
+                continue;
+            }
             const uint ib0 = (key*n_head_kv + hk)*NB;
             float s = 0.0;
             [[unroll]] for (uint b = 0; b < NB; ++b) {
@@ -103,7 +111,10 @@ void main() {
                 // codes are value + 8
                 s += float(data_k[ib].d)*(float(acc) - 8.0*qsum[b]);
             }
-            s = s*qsc + float(data_m[mrow + key]);
+            if (rel_dist != 0 && m > 0.5) {
+                m = data_rb[rb_offset + rel_dist*gq + uint(m) - 1u];
+            }
+            s = s*qsc + m;
             data_t[gq*s_stride + key] = s;
             mx = max(mx, s);
         }
@@ -111,11 +122,11 @@ void main() {
 
     red[tid] = mx;
     barrier();
-    if (tid < n_tok*r) {
+    if (tid < MAX_Q && tid < r) {
         float m = NEG;
-        for (uint i = tid; i < 256; i += MAX_Q) {
-            m = max(m, red[i]);
+        for (uint i = 0; i < LANES; ++i) {
+            m = max(m, red[tid*LANES + i]);
         }
-        data_t[off_mx + ((tid / r)*n_head_q + hk*r + tid % r)*n_wg + wg] = m;
+        data_t[off_mx + (t*n_head_q + hk*r + tid)*n_wg + wg] = m;
     }
 }

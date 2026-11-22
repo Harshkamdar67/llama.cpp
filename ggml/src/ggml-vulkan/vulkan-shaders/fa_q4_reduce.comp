@@ -13,8 +13,9 @@ layout(push_constant) uniform parameter
     uint off_mg;
     uint off_p;
     uint d_offset;
-    uint has_sinks;
+    uint has_sinks;  // 1: per head, 2: per token and head
     uint n_head_q;
+    uint s_offset;
 };
 
 layout(binding = 0) readonly  buffer T { float data_t[]; };
@@ -33,7 +34,7 @@ void main() {
         l   += data_t[base + i*(HS + 1) + HS];
     }
     if (has_sinks != 0) {
-        l += exp(data_s[gq % n_head_q] - data_t[off_mg + gq]);
+        l += exp(data_s[s_offset + (has_sinks == 2 ? gq : gq % n_head_q)] - data_t[off_mg + gq]);
     }
     data_d[d_offset + gq*HS + d] = l > 0.0 ? acc/l : 0.0;
 }

@@ -8,7 +8,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // Flash attention over a long Q4_0 cache: the weighted values.
-// Workgroup (256 keys, KV head), for the query slots of the KV head (slot = token*r + head), in two halves of
+// Workgroup (256 keys, KV head, token), for the query heads of the KV head (the slots), in two halves of
 // 128 keys that each write one row of partial sums. The weights exp(score - max) of the keys go to shared
 // memory first; a key whose weight is below thr for every slot is skipped without reading its values (with two
 // streams in one cache, that is every key of the other stream).
@@ -16,10 +16,7 @@
 // dims and walks the 128 keys of its half, so no sum crosses threads. The codes are value + 8 and a block has
 // one scale d: per key and slot the thread adds (w*d)*code for its 8 dims and keeps sum(w*d) for the offset.
 
-#ifndef FA_Q4_SLOTS
-#define FA_Q4_SLOTS 4
-#endif
-const uint MAX_Q = FA_Q4_SLOTS;
+const uint MAX_Q = 4;
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
@@ -57,12 +54,11 @@ void main() {
     const uint tid    = gl_LocalInvocationID.x;
     const uint wg     = gl_WorkGroupID.x;
     const uint hk     = gl_WorkGroupID.y;
-    const uint n_slot = n_tok*r;
 
-    // the queries of the slots (token*n_head_q + head), once: the divisions are not for the loops below
+    // the queries of the slots (token*n_head_q + head)
     uint gqs[MAX_Q];
     [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
-        gqs[s] = (s / r)*n_head_q + hk*r + s % r;
+        gqs[s] = gl_WorkGroupID.z*n_head_q + hk*r + s;
     }
 
     for (uint kl = tid; kl < KEYS; kl += 32) {
@@ -70,7 +66,7 @@ void main() {
         float m = 0.0;
         [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
             float x = 0.0;
-            if (s < n_slot && key < n_kv) {
+            if (s < r && key < n_kv) {
                 x = exp(data_t[gqs[s]*s_stride + key] - data_t[off_mg + gqs[s]]);
                 x = x < thr ? 0.0 : x;
             }
@@ -117,7 +113,7 @@ void main() {
     }
 
     [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
-        if (s < n_slot) {
+        if (s < r) {
             const uint p = off_p + (gqs[s]*n_part + wg*2 + hf)*(HS + 1);
             const vec4 sl = lo[s] - 8.0*off[s];
             const vec4 sh = hi[s] - 8.0*off[s];

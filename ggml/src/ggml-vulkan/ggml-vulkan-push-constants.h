@@ -256,6 +256,8 @@ struct vk_fa_q4_scores_push_constants {
     uint32_t off_mx;
     uint32_t off_q;
     float    scale;
+    uint32_t rel_dist;
+    uint32_t rb_offset;
 };
 
 struct vk_fa_q4_max_push_constants {
@@ -284,6 +286,7 @@ struct vk_fa_q4_reduce_push_constants {
     uint32_t d_offset;
     uint32_t has_sinks;
     uint32_t n_head_q;
+    uint32_t s_offset;
 };
 
 struct vk_op_inkling_tag_mask_push_constants {

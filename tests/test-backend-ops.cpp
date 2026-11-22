@@ -11168,6 +11168,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_rel(5000, 128, 1024, GGML_TYPE_F16, false));
     test_cases.emplace_back(new test_flash_attn_rel(2560, 128, 1024, GGML_TYPE_Q4_0, true));
     test_cases.emplace_back(new test_flash_attn_rel(4096, 256, 1024, GGML_TYPE_Q8_0, true));
+    // one and two tokens over a long Q4_0 cache
+    test_cases.emplace_back(new test_flash_attn_rel(9000, 1, 1024, GGML_TYPE_Q4_0, true));
+    test_cases.emplace_back(new test_flash_attn_rel(20000, 2, 1024, GGML_TYPE_Q4_0, true));
+    test_cases.emplace_back(new test_flash_attn_rel(16384, 2, 1024, GGML_TYPE_Q4_0, false));
+    test_cases.emplace_back(new test_flash_attn_rel(12000, 5, 1024, GGML_TYPE_Q4_0, true));
+    test_cases.emplace_back(new test_flash_attn_rel(8192, 8, 1024, GGML_TYPE_Q4_0, true));
     test_cases.emplace_back(new test_inkling_proj(64, 1, {8, 4, 12}, {0, 1, 2}));
     test_cases.emplace_back(new test_inkling_proj(64, 3, {8, 4, 12, 4, 8, 4, 4}, {0, 0, 1, 2, 2, 1, 0}));
     test_cases.emplace_back(new test_inkling_proj(2304, 1, {3072, 3072, 384, 24, 1024, 1024}, {0, 0, 0, 0, 1, 2}));

@@ -4101,10 +4101,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->integer_dot_product && device->subgroup_arithmetic && device->subgroup_require_full_support) {
         const uint32_t fa_q4_keys = 1024; // keys per scores workgroup
         ggml_vk_create_pipeline(device, device->pipeline_fa_q4[0], "fa_q4_query", fa_q4_query_len, fa_q4_query_data, "main", 2, sizeof(vk_fa_q4_query_push_constants), {1, 1, 1}, {}, 1);
-        // slot counts 4 (one token) and 8 (two tokens) as separate pipelines: sized for 8, a one-token step leaves 5 of 8 threads idle
-        ggml_vk_create_pipeline(device, device->pipeline_fa_q4[1], "fa_q4_scores", fa_q4_scores_len, fa_q4_scores_data, "main", 3, sizeof(vk_fa_q4_scores_push_constants), {fa_q4_keys, 1, 1}, {fa_q4_keys}, 1);
-        ggml_vk_create_pipeline(device, device->pipeline_fa_q4_wide[0], "fa_q4_scores_8", fa_q4_scores_8_len, fa_q4_scores_8_data, "main", 3, sizeof(vk_fa_q4_scores_push_constants), {fa_q4_keys, 1, 1}, {fa_q4_keys}, 1);
-        ggml_vk_create_pipeline(device, device->pipeline_fa_q4_wide[1], "fa_q4_values_8", fa_q4_values_8_len, fa_q4_values_8_data, "main", 2, sizeof(vk_fa_q4_values_push_constants), {256, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_fa_q4[1], "fa_q4_scores", fa_q4_scores_len, fa_q4_scores_data, "main", 4, sizeof(vk_fa_q4_scores_push_constants), {fa_q4_keys, 1, 1}, {fa_q4_keys}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_fa_q4[2], "fa_q4_max", fa_q4_max_len, fa_q4_max_data, "main", 1, sizeof(vk_fa_q4_max_push_constants), {1, 1, 1}, {}, 1, false, true);
         ggml_vk_create_pipeline(device, device->pipeline_fa_q4[3], "fa_q4_values", fa_q4_values_len, fa_q4_values_data, "main", 2, sizeof(vk_fa_q4_values_push_constants), {256, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_fa_q4[4], "fa_q4_reduce", fa_q4_reduce_len, fa_q4_reduce_data, "main", 3, sizeof(vk_fa_q4_reduce_push_constants), {1, 1, 1}, {}, 1);
@@ -9321,7 +9318,16 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
     static const int64_t min_kv   = getenv("GGML_VK_FA_Q4_DECODE_MIN_KV") ? atoll(getenv("GGML_VK_FA_Q4_DECODE_MIN_KV")) : 8192;
     static const float   thr      = getenv("GGML_VK_FA_Q4_DECODE_THR") ? (float) atof(getenv("GGML_VK_FA_Q4_DECODE_THR")) : 1e-12f;
 
-    if (disabled || ctx->device->pipeline_fa_q4[0] == nullptr || mask == nullptr) {
+    // a tagged mask with its bias table (ggml_flash_attn_ext_set_rel_bias) and sinks per token: the graph asks for
+    // them at one or two tokens only where this kernel takes the call (ggml_vk_fa_q4_decode_tagged), so no way out
+    const ggml_tensor * rel_bias = dst->src[6];
+    const bool tagged = rel_bias != nullptr || (sinks && sinks->ne[1] > 1);
+    if (tagged && q->ne[1] > 8) {
+        return false;
+    }
+
+    if ((disabled && !tagged) || ctx->device->pipeline_fa_q4[0] == nullptr || mask == nullptr) {
+        GGML_ASSERT(!tagged);
         return false;
     }
 
@@ -9341,12 +9347,15 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
 
     if (q->type != GGML_TYPE_F32 || q->ne[0] != 128 || n_tok < 1 || q->ne[3] != 1 || q->nb[0] != sizeof(float) ||
             !cache_layout(k) || !cache_layout(v) || v->ne[1] != n_kv || v->ne[2] != n_head_kv ||
-            r < 1 || n_tok*r > 8 || r*n_head_kv != n_head_q || n_kv < min_kv ||
+            r < 1 || r > 4 || n_tok > 8 || r*n_head_kv != n_head_q || n_kv < (tagged ? 8192 : min_kv) ||
             mask->type != GGML_TYPE_F16 || mask->ne[0] != n_kv || mask->ne[1] != n_tok || mask->ne[3] != 1 ||
             (mask->ne[2] != 1 && mask->ne[2] != n_head_q) || mask->nb[0] != sizeof(ggml_fp16_t) ||
             dst->nb[1] != dst->ne[0]*sizeof(float) || dst->nb[2] != dst->nb[1]*dst->ne[1] ||
-            (sinks && (sinks->type != GGML_TYPE_F32 || sinks->ne[1] != 1)) ||
-            dst->src[5] != nullptr || dst->src[6] != nullptr || params[1] != 0.0f || params[2] != 0.0f) {
+            (sinks && (sinks->type != GGML_TYPE_F32 || (sinks->ne[1] != 1 && sinks->ne[1] != n_tok) || sinks->ne[0] != n_head_q)) ||
+            (rel_bias && (rel_bias->type != GGML_TYPE_F32 || rel_bias->ne[1] != n_head_q || rel_bias->ne[2] != n_tok ||
+                          mask->ne[2] != 1 || !ggml_is_contiguous(rel_bias))) ||
+            dst->src[5] != nullptr || params[1] != 0.0f || params[2] != 0.0f) {
+        GGML_ASSERT(!tagged);
         return false;
     }
 
@@ -9363,21 +9372,18 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
     const uint64_t temp_sz  = ((uint64_t) off_p + (uint64_t) n_q*n_wg_v*129)*sizeof(float);
 
     if ((uint64_t) n_q*s_stride > UINT32_MAX/2) {
+        GGML_ASSERT(!tagged);
         return false;
     }
 
     if (temp_sz > ctx->device->properties.limits.maxStorageBufferRange) {
+        GGML_ASSERT(!tagged);
         return false;
     }
 
-    const bool wide = n_tok*r > 4;
     vk_pipeline pl[5];
     for (int i = 0; i < 5; ++i) {
         pl[i] = ctx->device->pipeline_fa_q4[i];
-    }
-    if (wide) {
-        pl[1] = ctx->device->pipeline_fa_q4_wide[0];
-        pl[3] = ctx->device->pipeline_fa_q4_wide[1];
     }
     for (int i = 0; i < 5; ++i) {
         ggml_pipeline_request_descriptor_sets(ctx, pl[i], 1);
@@ -9409,8 +9415,10 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
         (uint32_t) n_kv, (uint32_t) n_head_kv, (uint32_t) r, (uint32_t) mask->ne[2],
         (uint32_t) (mask->nb[1]/sizeof(ggml_fp16_t)), (uint32_t) (mask->nb[2]/sizeof(ggml_fp16_t)), (uint32_t) n_tok, (uint32_t) n_head_q,
         (uint32_t) (get_misalign_bytes(ctx, mask)/sizeof(ggml_fp16_t)), s_stride, n_wg_s, off_mx, off_q, params[0],
+        rel_bias ? (uint32_t) rel_bias->ne[0] : 0u, rel_bias ? (uint32_t) (get_misalign_bytes(ctx, rel_bias)/sizeof(float)) : 0u,
     };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pl[1], { k_buf, m_buf, t_buf }, pc0, { (uint32_t) n_kv, (uint32_t) n_head_kv, 1 });
+    ggml_vk_dispatch_pipeline(ctx, subctx, pl[1], { k_buf, m_buf, t_buf, rel_bias ? ggml_vk_tensor_subbuffer(ctx, rel_bias, true) : t_buf }, pc0,
+                              { (uint32_t) n_kv, (uint32_t) n_head_kv, (uint32_t) n_tok });
     ggml_vk_sync_buffers(ctx, subctx);
 
     const vk_fa_q4_max_push_constants pc1 = { n_wg_s, off_mx, off_mg };
@@ -9418,10 +9426,12 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
     ggml_vk_sync_buffers(ctx, subctx);
 
     const vk_fa_q4_values_push_constants pc2 = { (uint32_t) n_kv, (uint32_t) n_head_kv, (uint32_t) r, (uint32_t) n_tok, (uint32_t) n_head_q, s_stride, n_wg_v, off_mg, off_p, thr };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pl[3], { v_buf, t_buf }, pc2, { (uint32_t) n_kv, (uint32_t) n_head_kv, 1 });
+    ggml_vk_dispatch_pipeline(ctx, subctx, pl[3], { v_buf, t_buf }, pc2, { (uint32_t) n_kv, (uint32_t) n_head_kv, (uint32_t) n_tok });
     ggml_vk_sync_buffers(ctx, subctx);
 
-    const vk_fa_q4_reduce_push_constants pc3 = { n_wg_v, off_mg, off_p, (uint32_t) (get_misalign_bytes(ctx, dst)/sizeof(float)), sinks ? 1u : 0u, (uint32_t) n_head_q };
+    const vk_fa_q4_reduce_push_constants pc3 = { n_wg_v, off_mg, off_p, (uint32_t) (get_misalign_bytes(ctx, dst)/sizeof(float)),
+                                                     sinks ? (sinks->ne[1] > 1 ? 2u : 1u) : 0u, (uint32_t) n_head_q,
+                                                     sinks ? (uint32_t) (get_misalign_bytes(ctx, sinks)/sizeof(float)) : 0u };
     ggml_vk_dispatch_pipeline(ctx, subctx, pl[4], { t_buf, sinks ? ggml_vk_tensor_subbuffer(ctx, sinks, true) : t_buf, d_buf }, pc3, { 1, (uint32_t) n_q, 1 });
 
     ctx->prealloc_x_need_sync = true;
@@ -17291,6 +17301,22 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 // a tagged mask with a bias table, or sinks per token: the Xe prefill kernel only (batches of more than 8 tokens)
+                if ((op->src[6] != nullptr || (op->src[4] && op->src[4]->ne[1] > 1)) && op->src[0]->ne[1] <= 8) {
+                    // one or two tokens: the Q4_0 decode kernel (ggml_vk_flash_attn_q4_decode)
+                    const ggml_tensor * fq = op->src[0];
+                    const ggml_tensor * fk = op->src[1];
+                    const ggml_tensor * fv = op->src[2];
+                    auto cache_layout = [](const ggml_tensor * t) {
+                        return t->type == GGML_TYPE_Q4_0 && t->ne[0] == 128 && t->ne[3] == 1 &&
+                               t->nb[2] == ggml_row_size(t->type, t->ne[0]) && t->nb[1] == t->nb[2]*t->ne[2];
+                    };
+                    if (device->pipeline_fa_q4[0] == nullptr || op->src[3] == nullptr || fq->type != GGML_TYPE_F32 || fq->ne[0] != 128 ||
+                            !cache_layout(fk) || !cache_layout(fv) || fk->ne[1] < 8192 || fk->ne[2] == 0 ||
+                            fq->ne[2] % fk->ne[2] != 0 || fq->ne[2]/fk->ne[2] > 4) {
+                        return false;
+                    }
+                    return true;
+                }
                 if (op->src[6] != nullptr || (op->src[4] && op->src[4]->ne[1] > 1)) {
                     if (!device->xe_fa_support || op->src[0]->ne[1] <= 8 || op->src[0]->ne[0] % 32 != 0 || op->src[2]->ne[0] % 16 != 0 ||
                             op->src[3] == nullptr || op->src[0]->ne[2] / op->src[2]->ne[2] > 64) {
