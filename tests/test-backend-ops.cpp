@@ -11144,6 +11144,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    // one query token over a long Q4_0 cache in the cache layout (permuted view), with and without a mask per query head
+    for (int64_t kv : {8192, 20000}) {
+        for (int64_t mh : {1, 24}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                                                            {0, 2, 1, 3}, false, false, 0, 0, mh));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_rel(2560, 64, 1024, GGML_TYPE_F16, true));
     test_cases.emplace_back(new test_flash_attn_rel(2560, 256, 1024, GGML_TYPE_F16, true));
     test_cases.emplace_back(new test_flash_attn_rel(5000, 128, 1024, GGML_TYPE_F16, false));

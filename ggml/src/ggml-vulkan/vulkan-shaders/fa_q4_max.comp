@@ -1,0 +1,42 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Flash attention over a long Q4_0 cache, phase 2 of 4: the largest score of each query head, from the
+// per-block maxima of phase 1. One workgroup per query head.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_wg;
+    uint off_mx;
+    uint off_mg;
+};
+
+layout(binding = 0) buffer T { float data_t[]; };
+
+shared float red[32];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint hq  = gl_WorkGroupID.y;
+
+    float mx = -3.0e38;
+    for (uint i = tid; i < n_wg; i += 256) {
+        mx = max(mx, data_t[off_mx + hq*n_wg + i]);
+    }
+    mx = subgroupMax(mx);
+    if (subgroupElect()) {
+        red[gl_SubgroupID] = mx;
+    }
+    barrier();
+    if (tid == 0) {
+        float m = -3.0e38;
+        for (uint g = 0; g < gl_NumSubgroups; ++g) {
+            m = max(m, red[g]);
+        }
+        data_t[off_mg + hq] = m;
+    }
+}

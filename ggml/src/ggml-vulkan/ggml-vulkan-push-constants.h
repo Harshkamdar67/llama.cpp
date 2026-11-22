@@ -233,6 +233,50 @@ struct vk_op_dsv4_hc_pre_push_constants {
     float scale;
 };
 
+struct vk_fa_q4_query_push_constants {
+    uint32_t nbq2;
+    uint32_t q_offset;
+    uint32_t off_q;
+};
+
+struct vk_fa_q4_scores_push_constants {
+    uint32_t n_kv;
+    uint32_t n_head_kv;
+    uint32_t r;
+    uint32_t nem2;
+    uint32_t m_offset;
+    uint32_t s_stride;
+    uint32_t n_wg;
+    uint32_t off_mx;
+    uint32_t off_q;
+    float    scale;
+};
+
+struct vk_fa_q4_max_push_constants {
+    uint32_t n_wg;
+    uint32_t off_mx;
+    uint32_t off_mg;
+};
+
+struct vk_fa_q4_values_push_constants {
+    uint32_t n_kv;
+    uint32_t n_head_kv;
+    uint32_t r;
+    uint32_t s_stride;
+    uint32_t n_wg;
+    uint32_t off_mg;
+    uint32_t off_p;
+    float    thr;
+};
+
+struct vk_fa_q4_reduce_push_constants {
+    uint32_t n_wg;
+    uint32_t off_mg;
+    uint32_t off_p;
+    uint32_t d_offset;
+    uint32_t has_sinks;
+};
+
 struct vk_op_inkling_tag_mask_push_constants {
     uint32_t n_kv;
     uint32_t n_tps;

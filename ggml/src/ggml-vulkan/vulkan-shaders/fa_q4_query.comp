@@ -1,0 +1,63 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// Flash attention over a long Q4_0 cache: the query of each head quantized to 8 bits, once.
+// Per query head, 40 values in the scratch: 32 words of four packed bytes, the sum of the bytes of each
+// block of 32 dims (the codes are value + 8), the scale, and 3 unused. One workgroup per query head.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+const uint HS = 128;
+
+layout(push_constant) uniform parameter
+{
+    uint nbq2;       // elements between query heads
+    uint q_offset;
+    uint off_q;
+};
+
+layout(binding = 0) readonly buffer Q  { float   data_q[]; };
+layout(binding = 1)          buffer T  { float   data_t[]; };
+layout(binding = 1)          buffer TI { int32_t data_ti[]; };
+
+shared float qf[HS];
+shared float qsc;
+
+int q8(const float x, const float sc) {
+    return clamp(int(round(x/sc)), -127, 127);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint hq  = gl_WorkGroupID.y;
+
+    qf[tid] = data_q[q_offset + hq*nbq2 + tid];
+    barrier();
+    if (tid == 0) {
+        float mx = 1e-30;
+        for (uint e = 0; e < HS; ++e) {
+            mx = max(mx, abs(qf[e]));
+        }
+        qsc = mx/127.0;
+    }
+    barrier();
+
+    const float sc = qsc;
+    const uint  qb = off_q + hq*40;
+    if (tid < HS/4) {
+        const int a = q8(qf[4*tid], sc), b = q8(qf[4*tid + 1], sc), c = q8(qf[4*tid + 2], sc), d = q8(qf[4*tid + 3], sc);
+        data_ti[qb + tid] = int32_t((uint(a) & 0xFFu) | ((uint(b) & 0xFFu) << 8) | ((uint(c) & 0xFFu) << 16) | ((uint(d) & 0xFFu) << 24));
+    }
+    if (tid < 4) {
+        int s = 0;
+        for (uint e = 0; e < 32; ++e) {
+            s += q8(qf[tid*32 + e], sc);
+        }
+        data_t[qb + 32 + tid] = float(s);
+    }
+    if (tid == 4) {
+        data_t[qb + 36] = sc;
+    }
+}

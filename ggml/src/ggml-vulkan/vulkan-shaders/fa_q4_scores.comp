@@ -1,0 +1,110 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_integer_dot_product : require
+
+// Flash attention for one query token over a long Q4_0 cache: the scores.
+// The cache codes are integers, so a key's dot product with a query quantized to 8 bits (fa_q4_query.comp)
+// is four multiply-adds per instruction; the 4-bit keys carry 16 times the rounding error the query adds.
+// Workgroup (block of KEYS keys, KV head): thread (key lane, query head) keeps its head's 32 query words
+// and walks its keys, so nothing goes through shared memory until the block maximum at the end.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint MAX_R = 4;      // query heads per KV head
+const uint HS    = 128;
+const uint NB    = HS/32;
+const uint LANES = 256/MAX_R;
+const float NEG  = -3.0e38;
+
+layout(constant_id = 0) const uint KEYS = 1024;   // keys per workgroup, a multiple of LANES
+
+layout(push_constant) uniform parameter
+{
+    uint n_kv;
+    uint n_head_kv;
+    uint r;
+    uint nem2;
+    uint m_offset;
+    uint s_stride;   // scores per head (n_kv padded to KEYS)
+    uint n_wg;
+    uint off_mx;
+    uint off_q;      // per query head: 32 words, 4 block sums, the scale and 3 unused (40 values)
+    float scale;
+};
+
+struct block_q4 {
+    float16_t d;
+    uint16_t  qs[8];
+};
+
+layout(binding = 0) readonly buffer K  { block_q4  data_k[]; };
+layout(binding = 1) readonly buffer M  { float16_t data_m[]; };
+layout(binding = 2)          buffer T  { float     data_t[]; };
+layout(binding = 2)          buffer TI { int32_t   data_ti[]; };
+
+shared float red[256];
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint wg   = gl_WorkGroupID.x;
+    const uint hk   = gl_WorkGroupID.y;
+    const uint h    = tid % MAX_R;
+    const uint lane = tid / MAX_R;
+    const uint hq   = hk*r + h;
+
+    float mx = NEG;
+
+    if (h < r) {
+        // words 8b..8b+3 pair with the low nibbles of block b (its dims 0..15), 8b+4..8b+7 with the high ones
+        const uint qb = off_q + hq*40;
+        int32_t qw[32];
+        [[unroll]] for (uint j = 0; j < 32; ++j) {
+            qw[j] = data_ti[qb + j];
+        }
+        float qsum[NB];
+        [[unroll]] for (uint b = 0; b < NB; ++b) {
+            qsum[b] = data_t[qb + 32 + b];
+        }
+        const float qsc  = data_t[qb + 36]*scale;
+        const uint  mrow = m_offset + (hq % nem2)*n_kv;
+
+        for (uint it = 0; it < KEYS/LANES; ++it) {
+            const uint key = wg*KEYS + lane + LANES*it;
+            if (key >= n_kv) {
+                data_t[hq*s_stride + key] = NEG;
+                continue;
+            }
+            const uint ib0 = (key*n_head_kv + hk)*NB;
+            float s = 0.0;
+            [[unroll]] for (uint b = 0; b < NB; ++b) {
+                const uint ib = ib0 + b;
+                int32_t acc = 0;
+                [[unroll]] for (uint j = 0; j < 4; ++j) {
+                    const uint w = uint(data_k[ib].qs[2*j]) | (uint(data_k[ib].qs[2*j + 1]) << 16);
+                    acc += dotPacked4x8EXT(int32_t(w & 0x0F0F0F0Fu), qw[8*b + j]) +
+                           dotPacked4x8EXT(int32_t((w >> 4) & 0x0F0F0F0Fu), qw[8*b + 4 + j]);
+                }
+                // codes are value + 8
+                s += float(data_k[ib].d)*(float(acc) - 8.0*qsum[b]);
+            }
+            s = s*qsc + float(data_m[mrow + key]);
+            data_t[hq*s_stride + key] = s;
+            mx = max(mx, s);
+        }
+    }
+
+    red[tid] = mx;
+    barrier();
+    if (tid < r) {
+        float m = NEG;
+        for (uint i = tid; i < 256; i += MAX_R) {
+            m = max(m, red[i]);
+        }
+        data_t[off_mx + (hk*r + tid)*n_wg + wg] = m;
+    }
+}

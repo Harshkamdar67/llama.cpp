@@ -4093,6 +4093,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_conv_f32, "inkling_conv_f32", inkling_conv_f32_len, inkling_conv_f32_data, "main", 4, sizeof(vk_op_inkling_conv_push_constants), {256, 1, 1}, {}, 1);
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    if (device->integer_dot_product && device->subgroup_arithmetic && device->subgroup_require_full_support) {
+        const uint32_t fa_q4_keys = 1024; // keys per scores workgroup
+        ggml_vk_create_pipeline(device, device->pipeline_fa_q4[0], "fa_q4_query", fa_q4_query_len, fa_q4_query_data, "main", 2, sizeof(vk_fa_q4_query_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_fa_q4[1], "fa_q4_scores", fa_q4_scores_len, fa_q4_scores_data, "main", 3, sizeof(vk_fa_q4_scores_push_constants), {fa_q4_keys, 1, 1}, {fa_q4_keys}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_fa_q4[2], "fa_q4_max", fa_q4_max_len, fa_q4_max_data, "main", 1, sizeof(vk_fa_q4_max_push_constants), {1, 1, 1}, {}, 1, false, true);
+        ggml_vk_create_pipeline(device, device->pipeline_fa_q4[3], "fa_q4_values", fa_q4_values_len, fa_q4_values_data, "main", 2, sizeof(vk_fa_q4_values_push_constants), {256, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_fa_q4[4], "fa_q4_reduce", fa_q4_reduce_len, fa_q4_reduce_data, "main", 3, sizeof(vk_fa_q4_reduce_push_constants), {1, 1, 1}, {}, 1);
+    }
+#endif
     ggml_vk_create_pipeline(device, device->pipeline_inkling_tag_mask_f16, "inkling_tag_mask_f16", inkling_tag_mask_f16_len, inkling_tag_mask_f16_data, "main", 3, sizeof(vk_op_inkling_tag_mask_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_proj_q8_0, "inkling_proj_q8_0", inkling_proj_q8_0_len, inkling_proj_q8_0_data, "main", 11, sizeof(vk_op_inkling_proj_push_constants), {4, 1, 1}, { 32 }, 1, false, true);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_situ_f32, "inkling_situ_f32", inkling_situ_f32_len, inkling_situ_f32_data, "main", 2, sizeof(vk_op_inkling_situ_push_constants), {256, 1, 1}, {}, 1);
@@ -6141,11 +6151,22 @@ void ggml_vk_instance_init() {
     // GGML_VK_DEVICE_NAME keeps only the devices whose name contains it: with several GPUs on Windows the
     // enumeration order, and so every device index, can differ from one process to the next
     if (const char * name_env = getenv("GGML_VK_DEVICE_NAME")) {
+        // several names separated by commas keep those devices in the order given: "B60,RTX 3060" is Vulkan0, Vulkan1
         std::vector<size_t> kept;
-        for (size_t idx : vk_instance.device_indices) {
-            if (std::string(devices[idx].getProperties().deviceName.data()).find(name_env) != std::string::npos) {
-                kept.push_back(idx);
+        const std::string names(name_env);
+        for (size_t pos = 0; pos <= names.size(); ) {
+            size_t end = names.find(',', pos);
+            if (end == std::string::npos) {
+                end = names.size();
             }
+            const std::string name = names.substr(pos, end - pos);
+            for (size_t idx : vk_instance.device_indices) {
+                if (!name.empty() && std::string(devices[idx].getProperties().deviceName.data()).find(name) != std::string::npos &&
+                        std::find(kept.begin(), kept.end(), idx) == kept.end()) {
+                    kept.push_back(idx);
+                }
+            }
+            pos = end + 1;
         }
         if (kept.empty()) {
             GGML_LOG_WARN("ggml_vulkan: no device name contains GGML_VK_DEVICE_NAME=%s, keeping all\n", name_env);
@@ -9283,7 +9304,109 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+// One query token over a long Q4_0 cache in the cache layout: the generic kernels read it at a quarter of the
+// memory bandwidth (the same time as an F16 cache 3.5 times the size), because every code is converted to a
+// float and multiplied once per query head. Four small kernels instead: scores by integer dot products against
+// an 8-bit query, their maximum, the values of the keys whose weight is not negligible, and the final sum.
+static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
+                                         const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+    static const bool    disabled = getenv("GGML_VK_FA_Q4_DECODE_DISABLE") != nullptr;
+    static const int64_t min_kv   = getenv("GGML_VK_FA_Q4_DECODE_MIN_KV") ? atoll(getenv("GGML_VK_FA_Q4_DECODE_MIN_KV")) : 8192;
+    static const float   thr      = getenv("GGML_VK_FA_Q4_DECODE_THR") ? (float) atof(getenv("GGML_VK_FA_Q4_DECODE_THR")) : 1e-12f;
+
+    if (disabled || ctx->device->pipeline_fa_q4[0] == nullptr || mask == nullptr) {
+        return false;
+    }
+
+    const int64_t n_kv      = k->ne[1];
+    const int64_t n_head_kv = k->ne[2];
+    const int64_t n_head_q  = q->ne[2];
+    const int64_t r         = n_head_kv > 0 ? n_head_q/n_head_kv : 0;
+
+    auto cache_layout = [](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_Q4_0 && t->ne[0] == 128 && t->ne[3] == 1 &&
+               t->nb[2] == ggml_row_size(t->type, t->ne[0]) && t->nb[1] == t->nb[2]*t->ne[2];
+    };
+
+    const float * params = (const float *) dst->op_params;
+
+    if (q->type != GGML_TYPE_F32 || q->ne[0] != 128 || q->ne[1] != 1 || q->ne[3] != 1 || q->nb[0] != sizeof(float) ||
+            !cache_layout(k) || !cache_layout(v) || v->ne[1] != n_kv || v->ne[2] != n_head_kv ||
+            r < 1 || r > 4 || r*n_head_kv != n_head_q || n_kv < min_kv ||
+            mask->type != GGML_TYPE_F16 || mask->ne[0] != n_kv || mask->ne[1] != 1 || mask->ne[3] != 1 ||
+            (mask->ne[2] != 1 && (mask->ne[2] != n_head_q || mask->nb[2] != (size_t) n_kv*sizeof(ggml_fp16_t))) ||
+            (sinks && (sinks->type != GGML_TYPE_F32 || sinks->ne[1] != 1)) ||
+            dst->src[5] != nullptr || dst->src[6] != nullptr || params[1] != 0.0f || params[2] != 0.0f) {
+        return false;
+    }
+
+    // scratch, in floats: the scores of each query head, the maximum of each scores workgroup, the maximum of each
+    // head, the quantized queries (40 values a head), then per head and values workgroup 128 sums and their weight
+    const uint32_t keys     = ctx->device->pipeline_fa_q4[1]->wg_denoms[0];
+    const uint32_t n_wg_s   = (uint32_t) CEIL_DIV(n_kv, keys);
+    const uint32_t n_wg_v   = (uint32_t) CEIL_DIV(n_kv, 256);
+    const uint32_t s_stride = n_wg_s*keys;
+    const uint32_t off_mx   = (uint32_t) n_head_q*s_stride;
+    const uint32_t off_mg   = off_mx + (uint32_t) n_head_q*n_wg_s;
+    const uint32_t off_q    = off_mg + (uint32_t) n_head_q;
+    const uint32_t off_p    = off_q + (uint32_t) n_head_q*40;
+    const uint64_t temp_sz  = ((uint64_t) off_p + (uint64_t) n_head_q*n_wg_v*129)*sizeof(float);
+
+    if (temp_sz > ctx->device->properties.limits.maxStorageBufferRange) {
+        return false;
+    }
+
+    vk_pipeline * pl = ctx->device->pipeline_fa_q4;
+    for (int i = 0; i < 5; ++i) {
+        ggml_pipeline_request_descriptor_sets(ctx, pl[i], 1);
+    }
+
+    if (ctx->prealloc_size_x < temp_sz) {
+        ctx->prealloc_size_x = temp_sz;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_x_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q, true);
+    const vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    const vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
+    const vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, mask, true);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    const vk_subbuffer t_buf = { ctx->prealloc_x, 0, temp_sz };
+
+    // each phase reads what the one before wrote to the scratch
+    const vk_fa_q4_query_push_constants pcq = { (uint32_t) (q->nb[2]/sizeof(float)), (uint32_t) (get_misalign_bytes(ctx, q)/sizeof(float)), off_q };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pl[0], { q_buf, t_buf }, pcq, { 1, (uint32_t) n_head_q, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const vk_fa_q4_scores_push_constants pc0 = {
+        (uint32_t) n_kv, (uint32_t) n_head_kv, (uint32_t) r, (uint32_t) mask->ne[2],
+        (uint32_t) (get_misalign_bytes(ctx, mask)/sizeof(ggml_fp16_t)), s_stride, n_wg_s, off_mx, off_q, params[0],
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pl[1], { k_buf, m_buf, t_buf }, pc0, { (uint32_t) n_kv, (uint32_t) n_head_kv, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const vk_fa_q4_max_push_constants pc1 = { n_wg_s, off_mx, off_mg };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pl[2], { t_buf }, pc1, { 1, (uint32_t) n_head_q, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const vk_fa_q4_values_push_constants pc2 = { (uint32_t) n_kv, (uint32_t) n_head_kv, (uint32_t) r, s_stride, n_wg_v, off_mg, off_p, thr };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pl[3], { v_buf, t_buf }, pc2, { (uint32_t) n_kv, (uint32_t) n_head_kv, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const vk_fa_q4_reduce_push_constants pc3 = { n_wg_v, off_mg, off_p, (uint32_t) (get_misalign_bytes(ctx, dst)/sizeof(float)), sinks ? 1u : 0u };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pl[4], { t_buf, sinks ? ggml_vk_tensor_subbuffer(ctx, sinks, true) : t_buf, d_buf }, pc3, { 1, (uint32_t) n_head_q, 1 });
+
+    ctx->prealloc_x_need_sync = true;
+    return true;
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+    if (ggml_vk_flash_attn_q4_decode(ctx, subctx, q, k, v, mask, sinks, dst)) {
+        return;
+    }
     // relative-position bias behind a tagged mask (ggml_flash_attn_ext_set_rel_bias): only the Xe prefill kernel reads it
     const ggml_tensor * rel_bias = dst->src[6];
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
