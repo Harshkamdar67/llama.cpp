@@ -3967,7 +3967,8 @@ private:
         static int64_t gen_tick = 0;
         int32_t n_batch_prompt = n_batch;
         if (gen_share > 0 && !generating.empty()) {
-            n_batch_prompt = (++gen_tick % (gen_share + 1)) == 0 ? std::min(n_batch, (int32_t) batch.size() + n_ubatch) : 0;
+            // at most 256 prompt tokens in such an iteration, whatever the ubatch: at depth a 1024-token chunk stalls the writer for seconds
+            n_batch_prompt = (++gen_tick % (gen_share + 1)) == 0 ? std::min(n_batch, (int32_t) batch.size() + std::min(n_ubatch, 256)) : 0;
         }
 
         auto & alora_scale       = batch.alora_scale;
