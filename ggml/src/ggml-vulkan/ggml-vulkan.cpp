@@ -1574,6 +1574,10 @@ static vk_xe_fa_tuning_params get_xe_fa_tuning_params(const vk_device_struct * d
             pipeline_flag |= 1 << 3;
         }
 
+        if (pipeline_state.kv_q4) {
+            pipeline_flag |= 1 << 4;
+        }
+
         params.workgroup_size = { wg_sz };
         params.subgroup_size = { sg_sz };
         params.shmem_sz = shmem_sz;
@@ -9513,7 +9517,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint32_t cm2_min_reuse = KV >= 8192 ? 4096 : 8192;
     // Query reuse must cover the conversion and synchronization cost.
     const bool cm2_dequant_kv = KV >= 4096 && neq1 >= cm2_min_queries && (uint64_t) neq1 * qk_ratio >= cm2_min_reuse;
-    const bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
+    // Q4_0 K and V in the cache layout on Xe2: the prefill kernel decodes the codes as it stages them, so there is no
+    // conversion of the whole cache to F16 before every call (4 ms of 19 at 65K keys) and no scratch of 4 KB a key
+    const bool xe_q4_direct = ctx->device->xe_fa_support && ctx->device->vendor_id == VK_VENDOR_ID_INTEL &&
+                              ctx->device->architecture == vk_device_architecture::INTEL_XE2 && neq1 > 8 &&
+                              k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0 && HSK == 128 && HSV == 128 &&
+                              is_dense_kv_cache(k) && is_dense_kv_cache(v) && nek3 == 1 && nev3 == 1 &&
+                              !getenv("GGML_VK_XE_FA_NO_Q4_DIRECT");
+    const bool use_dequant_kv = !xe_q4_direct && ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -9646,11 +9657,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // quantized K/V of a large batch were converted above into a dense f16 scratch ([head][token][dim]), which the prefill kernel can read
     const bool xe_fa_dequant_kv = use_dequant_kv && !kv_raw_strided && neq1 > 8 && !getenv("GGML_VK_XE_FA_NO_DEQUANT_PREFILL");
     bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && mask != nullptr && !use_sparse && max_bias == 0.0f && logit_softcap == 0.0f &&
-                                 (xe_fa_dequant_kv || (tensor_aligned_with(k, 16u) && tensor_aligned_with(v, 16u)));
+                                 (xe_fa_dequant_kv || xe_q4_direct || (tensor_aligned_with(k, 16u) && tensor_aligned_with(v, 16u)));
     // q8_0/q4_0 K/V: only the dual-phase decode kernel reads them (dequantizing inline); larger batches keep the generic path
     const bool xe_fa_kv_quant = (k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0) && v->type == k->type &&
                                 neq1 <= 8 && neq2 / nev2 <= 64 && neq0 % 32 == 0 && nev0 % 32 == 0 && !getenv("GGML_VK_XE_FA_NO_QUANT_KV");
-    bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && ((k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) || xe_fa_kv_quant || xe_fa_dequant_kv) &&
+    bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && ((k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) || xe_fa_kv_quant || xe_fa_dequant_kv || xe_q4_direct) &&
                                  mask != nullptr && mask->type == GGML_TYPE_F16;
     xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype;
     std::pair<vk_pipeline, vk_pipeline> xe_fa_pipeline_dual_phases = { nullptr , nullptr };
@@ -9673,6 +9684,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 prefill_state.unaligned_q = head_stride_q % 8 != 0 || q_stride % 8 != 0 || batch_stride_q % 8 != 0;
                 prefill_state.partial_row_mask = neq1 > nem1;
                 prefill_state.multi_head_mask = nem2 > 1;
+                prefill_state.kv_q4 = xe_q4_direct;
                 xe_fa_params = get_xe_fa_tuning_params(vk_dev, prefill_state, true);
                 if (xe_fa_params.shmem_sz <= vk_dev->properties.limits.maxComputeSharedMemorySize) {
                     auto& xe_fa_pipelines = ctx->device->pipeline_xe_fa_prefill;

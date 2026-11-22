@@ -1,5 +1,7 @@
 #version 450
 
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -24,6 +26,13 @@ layout (binding = 3) readonly buffer MV2 {f16vec2 data_mv2[];};
 layout (binding = 3) readonly buffer MV4 {f16vec4 data_mv4[];};
 layout (binding = 4) readonly buffer S {float data_s[];};
 layout (binding = 5) buffer OV4 {vec4 data_ov4[];};
+// Q4_0 K and V in the cache layout ([head_dim][head][key] blocks), read as codes (KV_Q4_BIT)
+struct block_q4 {
+    float16_t d;
+    uint16_t  qs[8];
+};
+layout (binding = 1) readonly buffer KQ4 {block_q4 data_kq4[];};
+layout (binding = 2) readonly buffer VQ4 {block_q4 data_vq4[];};
 // relative-position bias [rel_dist, n_head_q, n_tokens], read where the mask holds 1 + distance (REL_BIAS_BIT)
 layout (binding = 6) readonly buffer RB {float data_rb[];};
 
@@ -75,12 +84,14 @@ layout (constant_id = 14) const uint gqa_fold = 1;
 #define UNALIGNED_Q_STRIDE_BIT (1 << 1)
 #define PARTIAL_ROW_MASK_BIT (1 << 2)
 #define INTEL_GPU_BIT (1 << 3)
+#define KV_Q4_BIT (1 << 4)
 #define SINK_ENABLE_BIT (1 << 16)
 #define REL_BIAS_BIT (1 << 17)
 #define SINK_PER_ROW_BIT (1 << 18)
 
 const bool aligned_q_stride = (Flags & UNALIGNED_Q_STRIDE_BIT) == 0;
 const bool seq_boundary_check = (Flags & UNALIGNED_SEQ_LEN_BIT) != 0;
+const bool kv_q4 = (Flags & KV_Q4_BIT) != 0;
 const bool partial_row_mask = (Flags & PARTIAL_ROW_MASK_BIT) != 0;
 const uint TK = 16;
 const uint sg_count = WorkGroupSize / SubGroupSize;
@@ -156,6 +167,24 @@ shared shf16v4_alias {
 shared shf16m2x4_alias {
     f16mat2x4 M2x4sh[shmem_size / 16];
 } F16M2x4Poolsh;
+
+// 8 consecutive dims (chunk c of a head's dims) of one key of a Q4_0 cache, as the kernel stages them in F16.
+// A block is 32 dims: its first 16 are the low nibbles of the 16 code bytes, the next 16 the high nibbles.
+#define Q4_CHUNK(NAME, DATA) \
+f16mat2x4 NAME(const uint key, const uint head, const uint n_head, const uint c) { \
+    const uint  ib   = (key * n_head + head) * (HSK / 32) + c / 4; \
+    const uint  part = c % 4; \
+    const uint  w    = (part & 1u) * 4; \
+    const uint  sh   = part >= 2 ? 4u : 0u; \
+    const float d    = float(DATA[ib].d); \
+    const uint  w0   = uint(DATA[ib].qs[w]) | (uint(DATA[ib].qs[w + 1]) << 16); \
+    const uint  w1   = uint(DATA[ib].qs[w + 2]) | (uint(DATA[ib].qs[w + 3]) << 16); \
+    const vec4  a    = (vec4(unpack8((w0 >> sh) & 0x0F0F0F0Fu)) - 8.0f) * d; \
+    const vec4  b    = (vec4(unpack8((w1 >> sh) & 0x0F0F0F0Fu)) - 8.0f) * d; \
+    return f16mat2x4(f16vec4(a), f16vec4(b)); \
+}
+Q4_CHUNK(q4_chunk_k, data_kq4)
+Q4_CHUNK(q4_chunk_v, data_vq4)
 
 void main() {
     const uint lane = gl_SubgroupInvocationID;
@@ -367,6 +396,10 @@ void main() {
                     if (mask_load_k[idx]) {
                         if (k_col == 4) {
                             F16V4Poolsh.F16V4sh[ksh_offset[idx]] = data_kv4[k_offset[idx]];
+                        } else if (kv_q4) {
+                            const uint kpos = idx * WorkGroupSize + sg * SubGroupSize + lane;
+                            F16M2x4Poolsh.M2x4sh[ksh_offset[idx]] =
+                                q4_chunk_k(min(loop * step_p + kpos / (HSK / k_col), p.nek1 - 1), head_k_idx, p.nek2, kpos % (HSK / k_col));
                         } else {
                             F16M2x4Poolsh.M2x4sh[ksh_offset[idx]] = data_km2x4[k_offset[idx]];
                         }
@@ -381,6 +414,10 @@ void main() {
 
                     if (k_col == 4) {
                         F16V4Poolsh.F16V4sh[ksh_offset[idx]] = data_kv4[k_offset[idx]];
+                    } else if (kv_q4) {
+                        const uint kpos = idx * WorkGroupSize + sg * SubGroupSize + lane;
+                        F16M2x4Poolsh.M2x4sh[ksh_offset[idx]] =
+                            q4_chunk_k(min(loop * step_p + kpos / (HSK / k_col), p.nek1 - 1), head_k_idx, p.nek2, kpos % (HSK / k_col));
                     } else {
                         F16M2x4Poolsh.M2x4sh[ksh_offset[idx]] = data_km2x4[k_offset[idx]];
                     }
@@ -607,7 +644,24 @@ void main() {
             Mf = Mnewf;
         }
 
-        if (v_in_shmem && (qk_sg == sg_count || sg >= sg_count - loadv_sg)) {
+        if (kv_q4 && v_in_shmem && (qk_sg == sg_count || sg >= sg_count - loadv_sg)) {
+            // one lane per key of the group (SubGroupSize == TK): its 8 dims of each row block, decoded in place
+            const uint v_key = loop * step_p + sg_v_c * TK + lane_c;
+            [[unroll]] for (uint r = 0; r < v_loops; ++r) {
+                const uint dim0 = TM * (sg_v_r + r * v_hori_groups);
+                if (dim0 < HSV) {
+                    f16mat2x4 vals = f16mat2x4(f16vec4(0.0f), f16vec4(0.0f));
+                    if (v_key < p.nek1) {
+                        vals = q4_chunk_v(v_key, head_v_idx, p.nev2, dim0 / 8);
+                    }
+                    const uint base = vsh_offset + TM * r * TK * v_hori_groups + lane_c;
+                    [[unroll]] for (uint i = 0; i < 4; ++i) {
+                        F16Poolsh.F16sh[base + i * TK]       = vals[0][i];
+                        F16Poolsh.F16sh[base + (4 + i) * TK] = vals[1][i];
+                    }
+                }
+            }
+        } else if (v_in_shmem && (qk_sg == sg_count || sg >= sg_count - loadv_sg)) {
             if (seq_boundary_check && loop + 1 == loop_count) {
                 const uint v_global_coord_base = loop * step_p + sg_v_c * TK + lane_c;
                 if (v_boundary_check) {

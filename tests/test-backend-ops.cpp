@@ -11154,6 +11154,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                             {0, 2, 1, 3}, false, false, 0, 0, mh));
         }
     }
+    // batches over a Q4_0 cache in the cache layout (the Xe2 prefill kernel reads the codes directly)
+    for (int64_t kv : {2048, 5000}) {
+        for (int64_t nb : {64, 256, 300}) {
+            for (int64_t mh : {1, 24}) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                                                                {0, 2, 1, 3}, false, false, 0, 0, mh));
+            }
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_rel(2560, 64, 1024, GGML_TYPE_F16, true));
     test_cases.emplace_back(new test_flash_attn_rel(2560, 256, 1024, GGML_TYPE_F16, true));
     test_cases.emplace_back(new test_flash_attn_rel(5000, 128, 1024, GGML_TYPE_F16, false));
