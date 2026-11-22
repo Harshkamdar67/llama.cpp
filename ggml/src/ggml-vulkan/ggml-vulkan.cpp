@@ -12631,9 +12631,15 @@ void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cg
     }
     if (mode == TOPK_MOE_SIGMOID_NORM_BIAS) {
         ggml_tensor * clamp = cgraph->nodes[node_idx + 8];
-        GGML_ASSERT(clamp->op == GGML_OP_CLAMP);
-        pc.clamp_min = ggml_get_op_params_f32(clamp, 0);
-        pc.clamp_max = ggml_get_op_params_f32(clamp, 1);
+        if (clamp->op == GGML_OP_SCALE) {
+            // sum + eps with a unit scale: for a sum of sigmoids, the clamp from below at eps
+            pc.clamp_min = ggml_get_op_params_f32(clamp, 1);
+            pc.clamp_max = INFINITY;
+        } else {
+            GGML_ASSERT(clamp->op == GGML_OP_CLAMP);
+            pc.clamp_min = ggml_get_op_params_f32(clamp, 0);
+            pc.clamp_max = ggml_get_op_params_f32(clamp, 1);
+        }
     }
     if (mode == TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS) {
         ggml_tensor * clamp = cgraph->nodes[node_idx + 9];
@@ -16058,7 +16064,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_EARLY_SOFTMAX_NORM;
                 fusion_string = "TOPK_MOE_EARLY_SOFTMAX_NORM";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
-            } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_sigmoid_norm_bias, { i + 4, i + 10 }) &&
+            } else if ((ggml_can_fuse_subgraph(cgraph, i, topk_moe_sigmoid_norm_bias, { i + 4, i + 10 }) ||
+                        (ggml_can_fuse_subgraph(cgraph, i, topk_moe_sigmoid_norm_eps_bias, { i + 4, i + 10 }) &&
+                         ggml_get_op_params_f32(cgraph->nodes[i + 8], 0) == 1.0f && ggml_get_op_params_f32(cgraph->nodes[i + 8], 1) > 0.0f)) &&
                        ggml_check_edges(cgraph, i, topk_moe_sigmoid_norm_bias_edges) &&
                        ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_SIGMOID_NORM_BIAS)) {
                 ctx->num_additional_fused_ops = topk_moe_sigmoid_norm_bias.size() - 1;
@@ -16391,7 +16399,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_topk_moe_pattern(topk_moe_early_softmax_norm)) {
             continue;
         }
-        if (keep_topk_moe_pattern(topk_moe_sigmoid_norm_bias)) {
+        if (keep_topk_moe_pattern(topk_moe_sigmoid_norm_bias) || keep_topk_moe_pattern(topk_moe_sigmoid_norm_eps_bias)) {
             continue;
         }
         if (keep_topk_moe_pattern(topk_moe_sqrt_softplus_norm_bias)) {
@@ -16460,6 +16468,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             };
             if (match_pattern(topk_moe_early_softmax_norm, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
+                match_pattern(topk_moe_sigmoid_norm_eps_bias, j) ||
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
                 match_pattern(topk_moe_early_softmax, j) ||
                 match_pattern(topk_moe_late_softmax, j) ||
