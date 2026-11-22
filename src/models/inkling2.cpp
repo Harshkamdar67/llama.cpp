@@ -451,6 +451,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
 
         const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
+        // the keys attention reads: with a tagged mask from the CPU, the range of this batch's sequences
+        static const bool gpu_tag = getenv("LLAMA_INKLING_GPU_TAG") != nullptr;
+        const bool    cpu_tag  = !is_swa && inp->self_attn_mask_tag && !gpu_tag;
         const int64_t n_kv     = rel_pos->ne[0];
 
         ggml_tensor * sinks = project(4, layer.attn_sink_proj, inputs[0]);
@@ -465,12 +468,25 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         // n_head) is built or read. Needs a backend whose flash attention takes ggml_flash_attn_ext_set_rel_bias
         // (Vulkan on Xe, the CPU), so it is opt-in: LLAMA_INKLING_REL_TAG=1.
         static const bool rel_tag = getenv("LLAMA_INKLING_REL_TAG") != nullptr && getenv("LLAMA_INKLING_NO_FUSE") == nullptr;
-        const bool use_tag = rel_tag && !is_swa && n_tokens >= 32 && cparams.flash_attn && mask_raw->type == GGML_TYPE_F16 &&
+        const auto * kv_base = static_cast<const llama_memory_hybrid_iswa_context *>(mctx)->get_attn()->get_base();
+        // one or two tokens over a long Q4_0 cache: the decode kernel of that case reads the tagged mask too
+        const bool tag_decode = n_tokens <= 8 && n_head/n_head_kv <= 4 && (cpu_tag ? inp->self_attn_mask_tag->ne[0] : n_kv) >= 8192 && n_stream == 1 &&
+                                kv_base->type_k() == GGML_TYPE_Q4_0 && kv_base->type_v() == GGML_TYPE_Q4_0 && n_embd_head == 128;
+        const bool use_tag = rel_tag && !is_swa && (n_tokens >= 32 || tag_decode) && cparams.flash_attn && mask_raw->type == GGML_TYPE_F16 &&
                              layer.attn_rel_bias->type == GGML_TYPE_F32 && layer.attn_rel_bias->ne[1] <= 2047;
         if (use_tag) {
             // [n_extent + 1, n_head, n_tokens]
             ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
-            kq_b = ggml_inkling_tag_mask(ctx0, rel_pos, mask_raw, table, (int) layer.attn_rel_bias->ne[1]);
+            if (cpu_tag) {
+                kq_b        = inp->self_attn_mask_tag;
+                fa_rel_bias = table;
+                if (inp->tag_range) {
+                    fa_kv_first = inp->tag_first;
+                    fa_kv_n     = kq_b->ne[0];
+                }
+            } else {
+                kq_b = ggml_inkling_tag_mask(ctx0, rel_pos, mask_raw, table, (int) layer.attn_rel_bias->ne[1]);
+            }
         } else if (!no_fuse_mask && cparams.flash_attn && mask_raw->type == GGML_TYPE_F16 && layer.attn_rel_bias->type == GGML_TYPE_F32) {
             // the whole per-head mask in one op, written once in F16: bias row by distance, minus the sink, plus the mask
             kq_b = ggml_inkling_rel_mask(ctx0, Rcur, layer.attn_rel_bias, sinks, rel_pos, mask_raw, GGML_TYPE_F16);

@@ -250,6 +250,12 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // the mask with the visible cells at a distance below extent holding 1 + distance (see ggml_inkling_tag_mask)
+    void set_input_attn_mask_tagged(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn, uint32_t extent) const;
+    // the cells [first, first + n) that hold every cell of the sequences of the batch, padded like get_n_kv()
+    std::pair<uint32_t, uint32_t> get_kv_range(const llama_ubatch & ubatch) const;
+    // the tagged mask of the cells [first, first + ne[0]) only: causal, one stream, no SWA, no ALiBi, 1D positions
+    void set_input_attn_mask_tagged_range(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, uint32_t first) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -455,6 +461,12 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // the mask with the visible cells at a distance below extent holding 1 + distance (see ggml_inkling_tag_mask)
+    void set_input_attn_mask_tagged(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn, uint32_t extent) const;
+    // the cells [first, first + n) that hold every cell of the sequences of the batch, padded like get_n_kv()
+    std::pair<uint32_t, uint32_t> get_kv_range(const llama_ubatch & ubatch) const;
+    // the tagged mask of the cells [first, first + ne[0]) only: causal, one stream, no SWA, no ALiBi, 1D positions
+    void set_input_attn_mask_tagged_range(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, uint32_t first) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

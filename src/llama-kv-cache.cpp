@@ -5,6 +5,7 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include <unordered_set>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -1037,6 +1038,41 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
+        // several sequences in one stream (a unified cache): each keeps to a region of its own, continuing after its
+        // last cell, so that attention can be given the cells of one sequence as a range (get_kv_range). A batch that
+        // mixes sequences places each token in the region of its sequence.
+        static const bool no_regions = getenv("LLAMA_KV_NO_SEQ_REGIONS") != nullptr;
+        if (!no_regions && !cont && n_stream == 1 && n_seq_max > 1 && swa_type == LLAMA_SWA_TYPE_NONE) {
+            std::unordered_map<llama_seq_id, uint32_t> cursors;
+            std::unordered_set<uint32_t> taken;
+            bool ok = true;
+            for (uint32_t i = 0; i < n_tokens && ok; ++i) {
+                const llama_seq_id sid = ubatch.seq_id[i][0];
+                auto it = cursors.find(sid);
+                if (it == cursors.end()) {
+                    uint32_t start = (uint32_t) (sid >= 0 ? sid % n_seq_max : 0)*(cells.size()/n_seq_max);
+                    if (cells.seq_pos_max(sid) >= 0) {
+                        start = (cells.seq_pos_get(sid).rbegin()->second + 1) % cells.size();
+                    }
+                    it = cursors.emplace(sid, start).first;
+                }
+                ok = false;
+                for (uint32_t n = 0; n < cells.size(); ++n) {
+                    const uint32_t idx = it->second;
+                    it->second = (idx + 1) % cells.size();
+                    if (cells.is_empty(idx) && taken.insert(idx).second) {
+                        res.idxs[s].push_back(idx);
+                        ok = true;
+                        break;
+                    }
+                }
+            }
+            if (!ok) {
+                return { };
+            }
+            continue;
+        }
+
         // if we have enough unused cells before the current head ->
         //   better to start searching from the beginning of the cache, hoping to fill it
         if (head_cur > cells.get_used() + 2*n_tokens) {
@@ -2019,6 +2055,132 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
         }
     }
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
+void llama_kv_cache::set_input_attn_mask_tagged(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn, uint32_t extent) const {
+    set_input_attn_mask(attn_mask, ubatch, causal_attn);
+
+    ggml_tensor * dst = attn_mask.raw;
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 && dst->ne[3] == 1 && ggml_backend_buffer_is_host(dst->buffer));
+
+    const int64_t n_kv = dst->ne[0];
+    ggml_fp16_t * data = (ggml_fp16_t *) dst->data;
+
+    // only the cells within the extent of some token of the batch can be tagged: collect them once
+    llama_pos pos_min = std::numeric_limits<llama_pos>::max();
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        pos_min = std::min(pos_min, ubatch->pos[i]);
+    }
+
+    const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[0][0]));
+    std::vector<std::pair<uint32_t, llama_pos>> near;
+    near.reserve(ubatch->n_tokens + extent);
+    for (int64_t j = 0; j < n_kv; ++j) {
+        if (!cells.is_empty(j) && int64_t(cells.pos_get(j)) > int64_t(pos_min) - int64_t(extent)) {
+            near.emplace_back((uint32_t) j, cells.pos_get(j));
+        }
+    }
+
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        ggml_fp16_t * row = data + (size_t) i*n_kv;
+        for (const auto & c : near) {
+            const int64_t distance = int64_t(ubatch->pos[i]) - c.second;
+            if (distance >= 0 && distance < extent && row[c.first] == zero) {
+                row[c.first] = ggml_fp32_to_fp16((float) (distance + 1));
+            }
+        }
+    }
+}
+
+std::pair<uint32_t, uint32_t> llama_kv_cache::get_kv_range(const llama_ubatch & ubatch) const {
+    const auto & cells = v_cells.at(seq_to_stream.at(ubatch.seq_id[0][0]));
+    const uint32_t n_pad = 256;
+    const uint32_t n_max = cells.used_max_p1();
+
+    uint32_t lo = n_max;
+    uint32_t hi = 0;
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+        for (uint32_t i = 0; i < lo; ++i) {
+            if (!cells.is_empty(i) && cells.seq_has(i, seq_id)) {
+                lo = i;
+                break;
+            }
+        }
+        for (uint32_t i = n_max; i > hi; --i) {
+            if (!cells.is_empty(i - 1) && cells.seq_has(i - 1, seq_id)) {
+                hi = i;
+                break;
+            }
+        }
+    }
+    if (hi <= lo) {
+        lo = 0;
+        hi = n_max;
+    }
+
+    lo = lo/n_pad*n_pad;
+    hi = std::min(cells.size(), std::max(lo + n_pad, GGML_PAD(hi, n_pad)));
+    return { lo, hi - lo };
+}
+
+void llama_kv_cache::set_input_attn_mask_tagged_range(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, uint32_t first) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 && dst->ne[3] == 1 && ggml_backend_buffer_is_host(dst->buffer));
+
+    const int64_t n = dst->ne[0];
+    ggml_fp16_t * data = (ggml_fp16_t *) dst->data;
+
+    const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[0][0]));
+    GGML_ASSERT(first + n <= cells.size());
+
+    const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+
+    llama_pos seq_pos_min[LLAMA_MAX_SEQ];
+    std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
+    }
+
+    // a later token of a sequence differs from its first one only in the cells near the batch
+    std::unordered_map<llama_seq_id, uint32_t> seq_srct;
+    std::unordered_map<llama_seq_id, std::vector<std::pair<uint32_t, llama_pos>>> seq_near;
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        const llama_pos    p1     = ubatch->pos[i];
+
+        ggml_fp16_t * row  = data + (size_t) i*n;
+        auto &        near = seq_near[seq_id];
+
+        const auto it = seq_srct.find(seq_id);
+        if (it == seq_srct.end()) {
+            seq_srct[seq_id] = i;
+            near.reserve(ubatch->n_tokens + extent);
+            for (int64_t c = 0; c < n; ++c) {
+                const uint32_t j = first + (uint32_t) c;
+                if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
+                    row[c] = drop;
+                    continue;
+                }
+                const llama_pos p0 = cells.pos_get(j);
+                if (int64_t(p0) > int64_t(seq_pos_min[seq_id]) - int64_t(extent)) {
+                    near.emplace_back((uint32_t) c, p0);
+                }
+                const int64_t distance = int64_t(p1) - p0;
+                row[c] = distance < 0 ? drop : distance < extent ? ggml_fp32_to_fp16((float) (distance + 1)) : keep;
+            }
+        } else {
+            const ggml_fp16_t * src = data + (size_t) it->second*n;
+            std::copy(src, src + n, row);
+            for (const auto & c : near) {
+                const int64_t distance = int64_t(p1) - c.second;
+                row[c.first] = distance < 0 ? drop : distance < extent ? ggml_fp32_to_fp16((float) (distance + 1)) : keep;
+            }
+        }
+    }
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
@@ -3126,6 +3288,18 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_relative_pos(dst, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_attn_mask_tagged(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn, uint32_t extent) const {
+    kv->set_input_attn_mask_tagged(attn_mask, ubatch, causal_attn, extent);
+}
+
+std::pair<uint32_t, uint32_t> llama_kv_cache_context::get_kv_range(const llama_ubatch & ubatch) const {
+    return kv->get_kv_range(ubatch);
+}
+
+void llama_kv_cache_context::set_input_attn_mask_tagged_range(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, uint32_t first) const {
+    kv->set_input_attn_mask_tagged_range(dst, ubatch, extent, first);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

@@ -808,6 +808,13 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // the base mask with the cells within the extent tagged 1 + distance, filled on the CPU (one stream per graph)
+    ggml_tensor * self_attn_mask_tag = nullptr; // F16 [n_kv, n_batch]
+
+    // the cells the tagged mask covers: the range of the sequences of the batch (all of n_kv without ranges)
+    uint32_t tag_first = 0;
+    bool     tag_range = false;
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1087,6 +1094,12 @@ struct llm_graph_amax_src1 {
 };
 
 struct llm_graph_context {
+    // relative-position bias table of the next flash attention built, whose mask is tagged (Inkling)
+    mutable ggml_tensor * fa_rel_bias = nullptr;
+    // the cells [first, first + n) of the cache that the next attention built reads, n = 0: all
+    mutable int64_t fa_kv_first = 0;
+    mutable int64_t fa_kv_n     = 0;
+
     const llama_model & model;
 
     const llama_hparams & hparams;

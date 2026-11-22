@@ -1417,6 +1417,16 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
 
+    if (self_attn_mask_tag && self_attn_mask_tag->buffer) {
+        if (tag_range) {
+            attn_ctx->get_base()->set_input_attn_mask_tagged_range(self_attn_mask_tag, ubatch, extent, tag_first);
+        } else {
+            llm_attn_mask tag = inp_attn->self_attn_mask;
+            tag.raw = self_attn_mask_tag;
+            attn_ctx->get_base()->set_input_attn_mask_tagged(tag, ubatch, cparams.causal_attn, extent);
+        }
+    }
+
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         attn_ctx->get_swa()->set_input_k_idxs(inp_attn->self_k_idxs_swa, ubatch);
@@ -1464,6 +1474,13 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
     res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
+    if (self_attn_mask_tag && tag_range) {
+        const auto range = attn_ctx->get_base()->get_kv_range(params.ubatch);
+        res &= range.first == tag_first && self_attn_mask_tag->ne[0] == range.second;
+        res &= self_attn_mask_tag->ne[1] == params.ubatch.n_tokens;
+    } else if (self_attn_mask_tag) {
+        res &= can_reuse_kq_mask(self_attn_mask_tag, attn_ctx->get_base(), params.ubatch, params.cparams);
+    }
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
@@ -3248,7 +3265,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (kq_mask && kq_mask->op == GGML_OP_INKLING_TAG_MASK && kq_mask->src[2]) {
             // the mask tags the keys near each query; their bias per head comes from the table the tag op carries
             ggml_flash_attn_ext_set_rel_bias(cur, kq_mask->src[2]);
+        } else if (fa_rel_bias) {
+            // a tagged mask filled on the CPU, the table passed by the model for this one attention
+            ggml_flash_attn_ext_set_rel_bias(cur, fa_rel_bias);
         }
+        fa_rel_bias = nullptr;
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
@@ -3869,6 +3890,14 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+
+    if (gctx.fa_kv_n > 0) {
+        // the mask covers a range of the cells: read the same range of K and V
+        GGML_ASSERT(!use_kv_cur && cparams.flash_attn && k->ne[3] == 1 && gctx.fa_kv_first + gctx.fa_kv_n <= k->ne[2]);
+        k = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], gctx.fa_kv_n, 1, k->nb[1], k->nb[2], k->nb[3], gctx.fa_kv_first*k->nb[2]);
+        v = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], gctx.fa_kv_n, 1, v->nb[1], v->nb[2], v->nb[3], gctx.fa_kv_first*v->nb[2]);
+    }
+    gctx.fa_kv_n = 0;
 
     ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
@@ -4499,6 +4528,23 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
+    // one stream per graph and flash attention: the tagged mask comes from the CPU, which knows the few cells near the
+    // batch, so the graphs that use it need no distance of every cell to every token
+    if (cparams.flash_attn && inp->get_attn()->self_attn_mask.raw->ne[3] == 1 && inp->get_attn()->self_attn_mask.raw->type == GGML_TYPE_F16) {
+        static const bool no_range = getenv("LLAMA_INKLING_NO_KV_RANGE") != nullptr;
+        if (!no_range && cparams.causal_attn && !hparams.use_alibi && !ubatch.is_pos_2d()) {
+            // only the cells of the sequences of the batch: in a cache shared by streams, not the other streams' cells
+            const auto range = attn_ctx->get_base()->get_kv_range(ubatch);
+            inp->tag_range = true;
+            inp->tag_first = range.first;
+            inp->self_attn_mask_tag = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, range.second, ubatch.n_tokens, 1, 1);
+            ggml_set_input(inp->self_attn_mask_tag);
+        } else {
+            inp->self_attn_mask_tag = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
+        }
+        ggml_set_name(inp->self_attn_mask_tag, "attn_inp_kq_mask_tag");
+    }
+
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
 
@@ -4526,7 +4572,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_b->op == GGML_OP_INKLING_REL_MASK || kq_b->op == GGML_OP_INKLING_TAG_MASK) {
+    if (kq_b->op == GGML_OP_INKLING_REL_MASK || kq_b->op == GGML_OP_INKLING_TAG_MASK || kq_b == inp->self_attn_mask_tag) {
         // the model built the whole mask, bias and input mask together, in the type flash attention takes
         kq_mask = kq_b;
     } else {
