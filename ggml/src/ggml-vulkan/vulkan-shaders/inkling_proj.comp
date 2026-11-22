@@ -1,0 +1,131 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Inkling 2: up to 7 Q8_0 matrices times up to 3 input vectors in one dispatch, the outputs one after another.
+// A layer visit has six such products on the attention side; as separate mat-vecs of 0.05 to 7 MB each they
+// run at about half the memory bandwidth of the card and pay a launch each.
+// Workgroup (rows / NUM_ROWS, token): NUM_ROWS rows of the matrix those rows fall in; thread tid takes blocks tid, tid + BLOCK_SIZE, ..
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+const uint MAX_W    = 7;
+const uint NUM_ROWS = 4;
+
+layout(push_constant) uniform parameter
+{
+    uint n_embd;
+    uint n_w;
+    uint nbd1;            // dst token stride, elements
+    uint d_offset;
+    uint x_offset[3];
+    uint nbx1[3];         // input token strides, elements
+    uint row_end[MAX_W];  // one past the last output row of each matrix
+    uint input_of[MAX_W];
+};
+
+struct block_q8 {
+    float16_t d;
+    int16_t   qs[16];
+};
+
+layout(binding = 0)  readonly  buffer X0 { float data_x0[]; };
+layout(binding = 1)  readonly  buffer X1 { float data_x1[]; };
+layout(binding = 2)  readonly  buffer X2 { float data_x2[]; };
+layout(binding = 3)  readonly  buffer W0 { block_q8 data_w0[]; };
+layout(binding = 4)  readonly  buffer W1 { block_q8 data_w1[]; };
+layout(binding = 5)  readonly  buffer W2 { block_q8 data_w2[]; };
+layout(binding = 6)  readonly  buffer W3 { block_q8 data_w3[]; };
+layout(binding = 7)  readonly  buffer W4 { block_q8 data_w4[]; };
+layout(binding = 8)  readonly  buffer W5 { block_q8 data_w5[]; };
+layout(binding = 9)  readonly  buffer W6 { block_q8 data_w6[]; };
+layout(binding = 10) writeonly buffer D  { float data_d[]; };
+
+shared float red[NUM_ROWS][32];
+
+#define LOAD_B(X) \
+    [[unroll]] for (uint k = 0; k < 32; ++k) { \
+        b[k] = X[xb + blk*32 + k]; \
+    }
+
+// two weights per 16-bit load: the low byte, then the high byte
+#define ROWS(W) \
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) { \
+        const uint ib = (r + n)*nb + blk; \
+        float s = 0.0; \
+        [[unroll]] for (uint k = 0; k < 16; ++k) { \
+            const int q = int(W[ib].qs[k]); \
+            s += float((q << 24) >> 24)*b[2*k] + float(q >> 8)*b[2*k + 1]; \
+        } \
+        acc[n] += float(W[ib].d)*s; \
+    }
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x*NUM_ROWS;
+    const uint t    = gl_WorkGroupID.y;
+
+    if (row0 >= row_end[n_w - 1]) {
+        return;
+    }
+
+    uint m     = 0;
+    uint start = 0;
+    [[unroll]] for (uint i = 0; i + 1 < MAX_W; ++i) {
+        if (i + 1 < n_w && row0 >= row_end[i]) {
+            m     = i + 1;
+            start = row_end[i];
+        }
+    }
+
+    const uint r  = row0 - start;
+    const uint nb = n_embd/32;
+    const uint xi = input_of[m];
+    const uint xb = x_offset[xi] + t*nbx1[xi];
+
+    float acc[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        acc[n] = 0.0;
+    }
+
+    for (uint blk = tid; blk < nb; blk += BLOCK_SIZE) {
+        float b[32];
+        switch (xi) {
+            case 0:  LOAD_B(data_x0) break;
+            case 1:  LOAD_B(data_x1) break;
+            default: LOAD_B(data_x2) break;
+        }
+        switch (m) {
+            case 0:  ROWS(data_w0) break;
+            case 1:  ROWS(data_w1) break;
+            case 2:  ROWS(data_w2) break;
+            case 3:  ROWS(data_w3) break;
+            case 4:  ROWS(data_w4) break;
+            case 5:  ROWS(data_w5) break;
+            default: ROWS(data_w6) break;
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        const float v = subgroupAdd(acc[n]);
+        if (subgroupElect()) {
+            red[n][gl_SubgroupID] = v;
+        }
+    }
+    barrier();
+
+    if (tid < NUM_ROWS) {
+        float s = 0.0;
+        for (uint g = 0; g < gl_NumSubgroups; ++g) {
+            s += red[tid][g];
+        }
+        data_d[d_offset + t*nbd1 + row0 + tid] = s;
+    }
+}

@@ -1104,6 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "INKLING_MIX",
     "INKLING_SITU",
     "INKLING_CONV",
+    "INKLING_PROJ",
 
     "UNARY",
 
@@ -1123,7 +1124,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1224,6 +1225,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "inkling_mix(query, cur, blocks...)",
     "inkling_situ(x)",
     "inkling_conv(cur, past, weight)",
+    "inkling_proj(inputs, weights)",
 
     "unary(x)",
 
@@ -1243,7 +1245,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6564,6 +6566,50 @@ struct ggml_tensor * ggml_inkling_conv(
     result->src[0] = cur;
     result->src[1] = past;
     result->src[2] = weight;
+
+    return result;
+}
+
+// ggml_inkling_proj
+
+struct ggml_tensor * ggml_inkling_proj(
+        struct ggml_context * ctx,
+        struct ggml_tensor ** inputs,
+        int                   n_inputs,
+        struct ggml_tensor ** weights,
+        const int           * input_of,
+        int                   n_weights) {
+    GGML_ASSERT(n_inputs >= 1 && n_inputs <= 3 && n_weights >= 1 && n_weights <= 7);
+
+    const int64_t n_embd   = inputs[0]->ne[0];
+    const int64_t n_tokens = inputs[0]->ne[1];
+
+    for (int i = 0; i < n_inputs; ++i) {
+        GGML_ASSERT(inputs[i]->type == GGML_TYPE_F32 && inputs[i]->nb[0] == sizeof(float));
+        GGML_ASSERT(inputs[i]->ne[0] == n_embd && inputs[i]->ne[1] == n_tokens && inputs[i]->ne[2] == 1 && inputs[i]->ne[3] == 1);
+    }
+
+    int64_t n_rows = 0;
+    for (int i = 0; i < n_weights; ++i) {
+        GGML_ASSERT(weights[i]->ne[0] == n_embd && weights[i]->ne[2] == 1 && weights[i]->ne[3] == 1);
+        GGML_ASSERT(input_of[i] >= 0 && input_of[i] < n_inputs);
+        n_rows += weights[i]->ne[1];
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rows, n_tokens);
+
+    ggml_set_op_params_i32(result, 0, n_weights);
+    for (int i = 0; i < n_weights; ++i) {
+        ggml_set_op_params_i32(result, 1 + i, input_of[i]);
+    }
+
+    result->op = GGML_OP_INKLING_PROJ;
+    for (int i = 0; i < 3; ++i) {
+        result->src[i] = inputs[i < n_inputs ? i : 0];
+    }
+    for (int i = 0; i < n_weights; ++i) {
+        result->src[3 + i] = weights[i];
+    }
 
     return result;
 }

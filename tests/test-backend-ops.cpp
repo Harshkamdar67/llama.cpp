@@ -4778,6 +4778,43 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_INKLING_PROJ
+struct test_inkling_proj : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const std::vector<int64_t> rows;
+    const std::vector<int> input_of;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_PROJ";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, rows.size());
+    }
+
+    test_inkling_proj(int64_t n_embd = 64, int64_t n_tokens = 1, std::vector<int64_t> rows = {8, 4, 12}, std::vector<int> input_of = {0, 1, 2})
+        : n_embd(n_embd), n_tokens(n_tokens), rows(rows), input_of(input_of) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * inputs[3];
+        for (int i = 0; i < 3; ++i) {
+            inputs[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(inputs[i], "x");
+        }
+        std::vector<ggml_tensor *> weights;
+        for (int64_t r : rows) {
+            weights.push_back(ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, r));
+            ggml_set_name(weights.back(), "w");
+        }
+
+        ggml_tensor * out = ggml_inkling_proj(ctx, inputs, 3, weights.data(), input_of.data(), (int) weights.size());
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_INKLING_CONV
 struct test_inkling_conv : public test_case {
     const int64_t n_ch;
@@ -11030,6 +11067,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    test_cases.emplace_back(new test_inkling_proj(64, 1, {8, 4, 12}, {0, 1, 2}));
+    test_cases.emplace_back(new test_inkling_proj(64, 3, {8, 4, 12, 4, 8, 4, 4}, {0, 0, 1, 2, 2, 1, 0}));
+    test_cases.emplace_back(new test_inkling_proj(2304, 1, {3072, 3072, 384, 24, 1024, 1024}, {0, 0, 0, 0, 1, 2}));
+    test_cases.emplace_back(new test_inkling_proj(2304, 2, {3072, 3072, 384, 24, 1024, 1024}, {0, 0, 0, 0, 1, 2}));
     test_cases.emplace_back(new test_inkling_conv(64, 1, 1, 1.0f));
     test_cases.emplace_back(new test_inkling_conv(1024, 4, 1, 1.0f));
     test_cases.emplace_back(new test_inkling_conv(2304, 2, 2, 0.447f));

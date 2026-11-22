@@ -402,12 +402,36 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         const float t  = hparams.f_qk_clip;
         const float c  = 1.0f/sqrtf((is_swa ? 1 : 2)*hparams.n_shortconv_l_cache + 1);
 
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
-        ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
+        // one token: the six projections that read the attention inputs in one op instead of six small mat-vecs
+        ggml_tensor * proj[6] = {};
+        static const bool no_fuse_proj = (getenv("LLAMA_INKLING_NO_FUSE") != nullptr || getenv("LLAMA_INKLING_NO_PROJ") != nullptr);
+        {
+            ggml_tensor * ws[6] = {layer.wq, layer.wk, layer.wv, layer.attn_rel, layer.attn_sink_proj, layer.wqkv_gate};
+            const int     of[6] = {0, 1, 2, 0, 0, 0};
+
+            bool fuse = !no_fuse_proj && n_tokens == 1 && (!loras || loras->empty());
+            for (ggml_tensor * w : ws) {
+                fuse = fuse && w && w->type == GGML_TYPE_Q8_0 && w->ne[0] == n_embd && w->ne[1] % 4 == 0;
+            }
+            if (fuse) {
+                ggml_tensor * all = ggml_inkling_proj(ctx0, inputs, 3, ws, of, 6);
+                size_t offs = 0;
+                for (int i = 0; i < 6; ++i) {
+                    proj[i] = ggml_view_2d(ctx0, all, ws[i]->ne[1], 1, ws[i]->ne[1]*sizeof(float), offs);
+                    offs += ws[i]->ne[1]*sizeof(float);
+                }
+            }
+        }
+        auto project = [&](int i, ggml_tensor * w, ggml_tensor * x) {
+            return proj[i] ? proj[i] : build_lora_mm(w, x);
+        };
+
+        ggml_tensor * Qcur = project(0, layer.wq, inputs[0]);
+        ggml_tensor * Kcur = convolve(project(1, layer.wk, inputs[1]), layer.attn_k_conv,
                 is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0, false);
-        ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
+        ggml_tensor * Vcur = convolve(project(2, layer.wv, inputs[2]), layer.attn_v_conv,
                 is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa, false);
-        ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
+        ggml_tensor * Rcur = project(3, layer.attn_rel, inputs[0]);
 
         Qcur = ggml_l2_norm(ctx0, ggml_mul(ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), layer.attn_q_clip), t);
         Kcur = ggml_l2_norm(ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), t/c);
@@ -429,7 +453,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
         const int64_t n_kv     = rel_pos->ne[0];
 
-        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+        ggml_tensor * sinks = project(4, layer.attn_sink_proj, inputs[0]);
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
@@ -469,7 +493,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, kq_b, sinks_zero, t*t/sqrtf(n_embd_head), il);
 
-        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, project(5, layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
         cb(cur, "attn_out", il);
     }

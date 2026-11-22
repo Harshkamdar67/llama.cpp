@@ -420,6 +420,7 @@ extern "C" {
         GGML_OP_INKLING_MIX,
         GGML_OP_INKLING_SITU,
         GGML_OP_INKLING_CONV,
+        GGML_OP_INKLING_PROJ,
 
         GGML_OP_UNARY,
 
@@ -2519,6 +2520,18 @@ extern "C" {
             struct ggml_tensor  * past,
             struct ggml_tensor  * weight,
             float                 scale);
+
+    // Inkling 2: several matrices times a few input vectors as one op, for the projections of a layer visit that
+    // read the same inputs. inputs: n_inputs <= 3 tensors [n_embd, n_tokens] with contiguous rows; weights:
+    // n_weights <= 7 matrices [n_embd, n_rows_i]; weight i multiplies inputs[input_of[i]].
+    // Result: [sum_i n_rows_i, n_tokens], the products one after another.
+    GGML_API struct ggml_tensor * ggml_inkling_proj(
+            struct ggml_context * ctx,
+            struct ggml_tensor ** inputs,
+            int                   n_inputs,
+            struct ggml_tensor ** weights,
+            const int           * input_of,
+            int                   n_weights);
 
     // Inkling 2 SITU activation of a fused gate/up tensor a = [gate (n_ff); up (n_ff)] per row:
     //   result = k * tanh(gate/beta)*sigmoid(gate) * (lb > 0 ? tanh(up/lb) : up),  k = scale

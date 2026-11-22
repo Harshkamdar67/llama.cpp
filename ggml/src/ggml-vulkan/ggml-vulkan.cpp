@@ -4093,6 +4093,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_conv_f32, "inkling_conv_f32", inkling_conv_f32_len, inkling_conv_f32_data, "main", 4, sizeof(vk_op_inkling_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_inkling_proj_q8_0, "inkling_proj_q8_0", inkling_proj_q8_0_len, inkling_proj_q8_0_data, "main", 11, sizeof(vk_op_inkling_proj_push_constants), {4, 1, 1}, { 32 }, 1, false, true);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_situ_f32, "inkling_situ_f32", inkling_situ_f32_len, inkling_situ_f32_data, "main", 2, sizeof(vk_op_inkling_situ_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_mix_f32[0], "inkling_mix_a_f32", inkling_mix_f32_len, inkling_mix_f32_data, "main", 11, sizeof(vk_op_inkling_mix_push_constants), {256, 1, 1}, { 256, 0 }, 1, false, true);
     ggml_vk_create_pipeline(device, device->pipeline_inkling_mix_f32[1], "inkling_mix_b_f32", inkling_mix_f32_len, inkling_mix_f32_data, "main", 11, sizeof(vk_op_inkling_mix_push_constants), {256, 1, 1}, { 256, 1 }, 1, false, true);
@@ -8203,6 +8204,46 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     init_pushconst_tensor_offsets(ctx, pc, x, residual, p_src, comb, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+}
+
+void ggml_vk_inkling_proj(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const int n_w = ggml_get_op_params_i32(dst, 0);
+
+    vk_pipeline pipeline = ctx->device->pipeline_inkling_proj_q8_0;
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_op_inkling_proj_push_constants pc = {};
+    pc.n_embd   = (uint32_t) dst->src[0]->ne[0];
+    pc.n_w      = (uint32_t) n_w;
+    pc.nbd1     = ggml_vk_nb_elem(dst, 1);
+    pc.d_offset = (uint32_t) (get_misalign_bytes(ctx, dst) / sizeof(float));
+
+    vk_subbuffer bufs[11];
+    for (int i = 0; i < 3; ++i) {
+        const ggml_tensor * x = dst->src[i];
+        bufs[i]        = ggml_vk_tensor_subbuffer(ctx, x, true);
+        pc.x_offset[i] = (uint32_t) (get_misalign_bytes(ctx, x) / sizeof(float));
+        pc.nbx1[i]     = ggml_vk_nb_elem(x, 1);
+    }
+
+    // unused weight bindings repeat the last matrix
+    uint32_t n_rows = 0;
+    for (int i = 0; i < 7; ++i) {
+        const ggml_tensor * W = dst->src[3 + std::min(i, n_w - 1)];
+        bufs[3 + i] = ggml_vk_tensor_subbuffer(ctx, W);
+        if (i < n_w) {
+            n_rows += (uint32_t) W->ne[1];
+            pc.input_of[i] = (uint32_t) ggml_get_op_params_i32(dst, 1 + i);
+        }
+        pc.row_end[i] = n_rows;
+    }
+    bufs[10] = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], bufs[6], bufs[7], bufs[8], bufs[9], bufs[10] },
+        pc, { n_rows, (uint32_t) dst->ne[1], 1 });
 }
 
 void ggml_vk_inkling_conv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -14054,6 +14095,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_inkling_conv(ctx, compute_ctx, node);
 
         break;
+    case GGML_OP_INKLING_PROJ:
+        ggml_vk_inkling_proj(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_MEAN:
         ggml_vk_mean(ctx, compute_ctx, src0, node);
 
@@ -17337,6 +17382,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->nb[0] == sizeof(float);
         case GGML_OP_INKLING_CONV:
             return op->src[1]->ne[1] <= 65535*256 && op->src[0]->ne[1] <= 65535;
+        case GGML_OP_INKLING_PROJ:
+            // Q8_0 matrices only, four rows per workgroup, whole blocks per thread
+            if (!device->subgroup_arithmetic || !device->subgroup_require_full_support || op->src[0]->ne[0] % 32 != 0) {
+                return false;
+            }
+            for (int i = 0; i < ggml_get_op_params_i32(op, 0); ++i) {
+                if (op->src[3 + i]->type != GGML_TYPE_Q8_0 || op->src[3 + i]->ne[1] % 4 != 0) {
+                    return false;
+                }
+            }
+            return true;
         case GGML_OP_INKLING_MIX:
             // up to 8 blocks and 4 queries, as the shader unrolls them
             return device->subgroup_arithmetic && device->subgroup_require_full_support &&

@@ -232,6 +232,17 @@ struct vk_op_dsv4_hc_pre_push_constants {
     float scale;
 };
 
+struct vk_op_inkling_proj_push_constants {
+    uint32_t n_embd;
+    uint32_t n_w;
+    uint32_t nbd1;
+    uint32_t d_offset;
+    uint32_t x_offset[3];
+    uint32_t nbx1[3];
+    uint32_t row_end[7];
+    uint32_t input_of[7];
+};
+
 struct vk_op_inkling_conv_push_constants {
     uint32_t n_ch;
     uint32_t n_tokens;

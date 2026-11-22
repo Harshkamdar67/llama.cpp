@@ -11562,6 +11562,44 @@ void ggml_compute_forward_dsv4_hc_pre(
     }
 }
 
+// ggml_compute_forward_inkling_proj
+
+void ggml_compute_forward_inkling_proj(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const int n_w = ggml_get_op_params_i32(dst, 0);
+
+    const int64_t n_embd   = dst->src[0]->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+
+    std::vector<float> row(n_embd);
+
+    int64_t base = 0;
+    for (int w = 0; w < n_w; ++w) {
+        const ggml_tensor * W = dst->src[3 + w];
+        const ggml_tensor * x = dst->src[ggml_get_op_params_i32(dst, 1 + w)];
+
+        const int64_t n_rows   = W->ne[1];
+        const size_t  row_size = ggml_row_size(W->type, n_embd);
+        const auto    to_float = ggml_get_type_traits(W->type)->to_float;
+
+        for (int64_t r = params->ith; r < n_rows; r += params->nth) {
+            const void  * p  = (const char *) W->data + r*row_size;
+            const float * wr = (const float *) p;
+            if (W->type != GGML_TYPE_F32) {
+                to_float(p, row.data(), n_embd);
+                wr = row.data();
+            }
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                float s = 0.0f;
+                ggml_vec_dot_f32(n_embd, &s, 0, wr, 0, (const float *) ((const char *) x->data + t*x->nb[1]), 0, 1);
+                ((float *) ((char *) dst->data + t*dst->nb[1]))[base + r] = s;
+            }
+        }
+        base += n_rows;
+    }
+}
+
 // ggml_compute_forward_inkling_conv
 
 void ggml_compute_forward_inkling_conv(
