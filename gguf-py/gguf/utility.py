@@ -249,7 +249,7 @@ class SafetensorRemote:
         # a conversion makes one request per tensor: retry the transient failures instead of losing hours of work
         import time
         last_err: Exception | None = None
-        for attempt in range(8):
+        for attempt in range(12):
             try:
                 response = cls._session().get(url, allow_redirects=True, headers=headers, timeout=(30, 600))
                 if response.status_code in (408, 429, 500, 502, 503, 504):
@@ -260,7 +260,7 @@ class SafetensorRemote:
                     raise requests.ConnectionError(f"short read: {len(data)} of {size} bytes")
                 # Get raw byte data
                 return data[slice(size if size > -1 else None)]
-            except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
+            except requests.RequestException as e:   # also a connection that breaks in the middle of a read
                 status = getattr(getattr(e, "response", None), "status_code", None)
                 if status is not None and status not in (408, 429, 500, 502, 503, 504):
                     raise
