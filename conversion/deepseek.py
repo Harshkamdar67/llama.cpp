@@ -489,6 +489,11 @@ class SarvamMLAModel(DeepseekV2Model):
         if self.rope_parameters.get("rope_type", self.rope_parameters.get("type")) == "deepseek_yarn":
             self.rope_parameters["rope_type"] = "yarn"
 
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        # no low-rank query projection: a rank of 0 lets llama.cpp builds that require the key load the file
+        self.gguf_writer.add_q_lora_rank(0)
+
     def set_vocab(self):
         # BPE with byte fallback: mark <0xXX> tokens as BYTE so they decode to raw bytes
         tokens, toktypes, tokpre = self.get_vocab_base()
