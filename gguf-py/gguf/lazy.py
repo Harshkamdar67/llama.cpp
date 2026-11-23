@@ -162,6 +162,9 @@ class LazyBase(ABC, metaclass=LazyMeta):
                 return fn(*eager_args, **kwargs)
         return wrapped_fn
 
+    # threads that load the lazy inputs of one node together, 0 or 1: one after the other
+    parallel_args: int = 0
+
     @classmethod
     def to_eager(cls, t: Any) -> Any:
         def simple_to_eager(_t: LazyBase) -> Any:
@@ -171,6 +174,21 @@ class LazyBase(ABC, metaclass=LazyMeta):
             # NOTE: there's a recursion limit in Python (usually 1000)
 
             assert _t._func is not None
+            if cls.parallel_args > 1:
+                # many lazy inputs whose loading waits on I/O (a stack of tensors read remotely): load them together
+                pending: list[LazyBase] = []
+
+                def collect(o: Any) -> None:
+                    if isinstance(o, (list, tuple)):
+                        for x in o:
+                            collect(x)
+                    elif isinstance(o, LazyBase) and o._data is None:
+                        pending.append(o)
+                collect(_t._args)
+                if len(pending) >= 8:
+                    from concurrent.futures import ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=cls.parallel_args) as pool:
+                        list(pool.map(simple_to_eager, pending))
             _t._args = cls._recurse_apply(_t._args, simple_to_eager)
             _t._data = _t._func(*_t._args, **_t._kwargs)
             # sanity check

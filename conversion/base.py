@@ -158,6 +158,9 @@ class ModelBase:
         self.lazy = not eager or (remote_hf_model_id is not None)
         self.dry_run = dry_run
         self.remote_hf_model_id = remote_hf_model_id
+        if remote_hf_model_id is not None:
+            # stacks of remote tensors (the experts of a layer) are read by several connections at once
+            LazyTorchTensor.parallel_args = 8
         self.sentence_transformers_dense_modules = sentence_transformers_dense_modules
         self.target_model_dir = target_model_dir
         self.fuse_gate_up_exps = fuse_gate_up_exps

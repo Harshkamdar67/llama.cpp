@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 import os
+import threading
 import json
 import numpy as np
 
@@ -217,6 +218,18 @@ class SafetensorRemote:
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse safetensor metadata as JSON: {e}")
 
+    _thread_local = threading.local()
+
+    @classmethod
+    def _session(cls):
+        # one connection pool per thread: a conversion makes thousands of range requests to the same two hosts
+        import requests
+        session = getattr(cls._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            cls._thread_local.session = session
+        return session
+
     @classmethod
     def get_data_by_range(cls, url: str, start: int, size: int = -1) -> bytes:
         """
@@ -238,7 +251,7 @@ class SafetensorRemote:
         last_err: Exception | None = None
         for attempt in range(8):
             try:
-                response = requests.get(url, allow_redirects=True, headers=headers, timeout=(30, 600))
+                response = cls._session().get(url, allow_redirects=True, headers=headers, timeout=(30, 600))
                 if response.status_code in (408, 429, 500, 502, 503, 504):
                     raise requests.HTTPError(f"HTTP {response.status_code}", response=response)
                 response.raise_for_status()
