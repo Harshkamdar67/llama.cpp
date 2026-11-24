@@ -452,6 +452,9 @@ llama_model_deepseek2::graph::graph(const llm_graph_params & params) :
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        // the layer inputs a DFlash/DSpark draft reads (Sarvam 105B ships a DSpark draft)
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         // norm
